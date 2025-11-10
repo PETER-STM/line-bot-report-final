@@ -121,9 +121,10 @@ def handle_message(event):
         elif text == '測試':
             response = "Bot 正常運作中！資料庫連接狀態良好。"
         elif re.match(r'^\d{1,2}/\d{1,2}\(\w\).*', text):
+            # 為了檢查部署是否成功，我們在這裡新增 (v3) 標記
             response = handle_record_expense(text)
         else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 彼 市集'。"
+            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 彼 市集' (v3)。"
             
     except Exception as e:
         app.logger.error(f"處理指令失敗: {e}")
@@ -251,10 +252,7 @@ def parse_record_command(text: str):
     current_year = today.year
     input_month = int(record_date_str.split('/')[0])
     
-    # 判斷年份：如果輸入月份 > 當前月份，且差距很大（如現在 1 月，輸入 11 月），則判斷為去年
-    # 避免邏輯複雜化，簡單假設：如果輸入的月份比當前月份大，則判斷為去年，否則為今年。
-    # 修正：若輸入月份在當前月份之後 (e.g. 11/11 紀錄 12/11)，則假定為明年 (但 LINE BOT 通常只記錄過去或當前月份)
-    # 最安全的做法是：如果輸入月份大於當前月份（例如現在是 1 月，輸入 12 月），則假定為前一年的 12 月。
+    # 判斷年份：如果輸入月份 > 當前月份，則假定為前一年的日期 (只針對年初跨年情況)
     if today.month == 1 and input_month == 12:
         record_year = current_year - 1
     elif today.month > 1 and input_month > today.month:
@@ -317,7 +315,9 @@ def handle_record_expense(text: str) -> str:
         if manual_cost is not None:
             C = manual_cost
         else:
-            is_weekend = (day_of_week in ['六', '日'])
+            # 判斷是平日還是假日，使用 date.weekday() 來代替解析星期
+            # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+            is_weekend = (full_date.weekday() >= 5) 
             with conn.cursor() as cur:
                 cur.execute("SELECT weekday_cost, weekend_cost FROM locations WHERE name = %s", (location_name,))
                 result = cur.fetchone()
@@ -399,6 +399,9 @@ def handle_record_expense(text: str) -> str:
 def handle_management_stat(text: str) -> str:
     """處理 統計 [人名] [月份] 指令"""
     parts = text.split()
+    if len(parts) != 3 or parts[0] != '統計':
+        return "❌ 統計指令格式錯誤。請使用: 統計 [人名/公司] [月份 (例如 9月)]。"
+        
     target_name = parts[1]
     month_str = parts[2].replace('月', '').strip()
 
@@ -454,8 +457,11 @@ def handle_management_delete(text: str) -> str:
                 if not date_match:
                     return "❌ 刪除紀錄指令的日期格式錯誤 (月/日(星期))。"
                 
-                # 使用解析函式，確保年份判斷一致
-                parsed_date_data, _ = parse_record_command(text)
+                # 重新解析整個指令，取得正確的日期 (因為刪除指令的格式與紀錄指令相似)
+                # 這裡使用一個臨時解析器來判斷日期，因為 record_command 函式包含複雜的邏輯
+                temp_text = f"{date_part_str} {member_name} 測試地點 1" # 構造一個紀錄指令格式
+                parsed_date_data, _ = parse_record_command(temp_text)
+                
                 if not parsed_date_data:
                     return "❌ 刪除紀錄指令的日期格式或內容無效。"
                     
