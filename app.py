@@ -44,10 +44,10 @@ def init_db():
         
     try:
         with conn.cursor() as cur:
-            # 1. 地點設定表
+            # 1. 地點設定表 (修正：欄位名稱由 name 統一改為 location_name)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS locations (
-                    name VARCHAR(50) PRIMARY KEY,
+                    location_name VARCHAR(50) PRIMARY KEY,
                     weekday_cost INTEGER NOT NULL,
                     weekend_cost INTEGER NOT NULL
                 );
@@ -66,7 +66,7 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     record_date DATE NOT NULL,
                     member_name VARCHAR(50) REFERENCES members(name),
-                    location_name VARCHAR(50) REFERENCES locations(name),
+                    location_name VARCHAR(50) REFERENCES locations(location_name), -- 修正：引用 locations(location_name)
                     cost_paid INTEGER NOT NULL,
                     original_msg TEXT,
                     unique_group_id UUID DEFAULT uuid_generate_v4()
@@ -75,7 +75,14 @@ def init_db():
             
             # 確保 '公司' 作為分攤單位存在於 members 表
             cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (COMPANY_NAME,))
-        
+            
+            # 自動插入 Bot 嘗試寫入的地點 '市集'，解決外鍵錯誤 (上次新增的邏輯)
+            cur.execute("""
+                INSERT INTO locations (location_name, weekday_cost, weekend_cost)
+                VALUES (%s, 0, 0)
+                ON CONFLICT (location_name) DO NOTHING;
+            """, ('市集',))
+            
         conn.commit()
         app.logger.info("資料庫初始化完成或已存在。")
     except Exception as e:
@@ -160,9 +167,9 @@ def handle_management_add(text: str) -> str:
             elif len(parts) == 4 and parts[1] == '地點':
                 loc_name, cost_val = parts[2], int(parts[3])
                 cur.execute("""
-                    INSERT INTO locations (name, weekday_cost, weekend_cost)
+                    INSERT INTO locations (location_name, weekday_cost, weekend_cost) -- 修正：使用 location_name
                     VALUES (%s, %s, %s)
-                    ON CONFLICT (name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
+                    ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
                 """, (loc_name, cost_val, cost_val))
                 return f"✅ 地點「{loc_name}」已設定成功，平日/假日成本皆為 {cost_val}。"
 
@@ -170,12 +177,12 @@ def handle_management_add(text: str) -> str:
             elif len(parts) == 6 and parts[1] == '地點' and parts[3].lower() == '平日' and parts[5].lower() == '假日':
                 loc_name, weekday_cost_val, weekend_cost_val = parts[2], int(parts[4]), int(parts[5])
                 cur.execute("""
-                    INSERT INTO locations (name, weekday_cost, weekend_cost)
+                    INSERT INTO locations (location_name, weekday_cost, weekend_cost) -- 修正：使用 location_name
                     VALUES (%s, %s, %s)
-                    ON CONFLICT (name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
+                    ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
                 """, (loc_name, weekday_cost_val, weekend_cost_val))
                 return f"✅ 地點「{loc_name}」已設定成功，平日 {weekday_cost_val}，假日 {weekend_cost_val}。"
-            
+                
             else:
                 return "❌ 新增指令格式錯誤。請檢查指令是否完整。"
 
@@ -197,7 +204,7 @@ def handle_management_list(text: str) -> str:
     parts = text.split()
     if len(parts) != 2 or parts[0] != '清單':
         return "❌ 清單指令格式錯誤。請使用: 清單 人名 或 清單 地點。"
-    
+        
     list_type = parts[1].lower()
     conn = get_db_connection()
     if not conn: return "❌ 資料庫連接失敗。"
@@ -214,7 +221,7 @@ def handle_management_list(text: str) -> str:
                 return f"📋 **現有成員 (業務員/公司):**\n{member_list_str}"
 
             elif list_type == '地點':
-                cur.execute("SELECT name, weekday_cost, weekend_cost FROM locations ORDER BY name;")
+                cur.execute("SELECT location_name, weekday_cost, weekend_cost FROM locations ORDER BY location_name;") # 修正：使用 location_name
                 locations = cur.fetchall()
                 
                 if not locations: return "📋 目前沒有任何已設定的地點。"
@@ -300,7 +307,7 @@ def handle_record_expense(text: str) -> str:
     parsed_data, error = parse_record_command(text)
     if error:
         return f"❌ 指令解析失敗: {error}"
-    
+        
     full_date = parsed_data['full_date']
     day_of_week = parsed_data['day_of_week']
     member_names = parsed_data['member_names']
@@ -320,7 +327,7 @@ def handle_record_expense(text: str) -> str:
             # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
             is_weekend = (full_date.weekday() >= 5) 
             with conn.cursor() as cur:
-                cur.execute("SELECT weekday_cost, weekend_cost FROM locations WHERE name = %s", (location_name,))
+                cur.execute("SELECT weekday_cost, weekend_cost FROM locations WHERE location_name = %s", (location_name,)) # 修正：使用 location_name
                 result = cur.fetchone()
             
             if not result:
@@ -413,7 +420,7 @@ def handle_management_stat(text: str) -> str:
             raise ValueError
     except ValueError:
         return "❌ 月份格式錯誤。請輸入有效的數字月份 (1 到 12)。"
-    
+        
     conn = get_db_connection()
     if not conn: return "❌ 資料庫連接失敗。"
 
@@ -503,12 +510,12 @@ def handle_management_delete(text: str) -> str:
             # --- 3. 刪除地點 (刪除 地點 市集) ---
             elif len(parts) == 3 and parts[1] == '地點':
                 loc_name = parts[2]
-                cur.execute("DELETE FROM locations WHERE name = %s;", (loc_name,))
+                cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,)) # 修正：使用 location_name
                 if cur.rowcount > 0:
                     return f"✅ 地點 {loc_name} 已成功刪除。"
                 else:
                     return f"💡 地點 {loc_name} 不存在。"
-            
+                
             else:
                 return "❌ 刪除指令格式錯誤。請檢查指令是否完整。"
 
