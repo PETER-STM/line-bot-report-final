@@ -121,10 +121,10 @@ def handle_message(event):
         elif text == '測試':
             response = "Bot 正常運作中！資料庫連接狀態良好。"
         elif re.match(r'^\d{1,2}/\d{1,2}\(\w\).*', text):
-            # 為了檢查部署是否成功，我們在這裡新增 (v3) 標記
             response = handle_record_expense(text)
         else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 彼 市集' (v3)。"
+            # 這裡加入標記 (v3-final)
+            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 彼 市集' (v3-final)。"
             
     except Exception as e:
         app.logger.error(f"處理指令失敗: {e}")
@@ -137,7 +137,7 @@ def handle_message(event):
 
 # --- 5. 核心功能實現 ---
 
-# [A] 新增/更新功能 (已完成)
+# [A] 新增/更新功能
 def handle_management_add(text: str) -> str:
     """處理 新增 地點/人名 指令"""
     parts = text.split()
@@ -190,7 +190,7 @@ def handle_management_add(text: str) -> str:
         
     return "❌ 新增指令格式錯誤。"
 
-# [B] 清單查詢功能 (已完成)
+# [B] 清單查詢功能
 def handle_management_list(text: str) -> str:
     """處理 清單 人名/地點 指令，查詢並列出設定"""
     parts = text.split()
@@ -293,7 +293,7 @@ def parse_record_command(text: str):
         'manual_cost': manual_cost
     }, None
 
-# [D] 費用紀錄功能 (兩階段分攤邏輯) (已完成)
+# [D] 費用紀錄功能 (兩階段分攤邏輯)
 def handle_record_expense(text: str) -> str:
     """處理費用紀錄指令，實作兩階段分攤邏輯。"""
     parsed_data, error = parse_record_command(text)
@@ -380,7 +380,8 @@ def handle_record_expense(text: str) -> str:
                 ))
             
         conn.commit()
-        return f"""✅ 紀錄成功！總成本 {C}。
+        # 這裡加入標記 (v3-final)
+        return f"""✅ 紀錄成功 (v3-final)！總成本 {C}。
 --------------------------------
 公司 (1 單位) 應攤提費用: {C_company_final}
 {N} 位業務員 (總體 1 單位) 每人應攤提費用: {C_member_individual}"""
@@ -395,7 +396,7 @@ def handle_record_expense(text: str) -> str:
         if conn: conn.close()
 
 
-# [E] 費用統計功能 (已完成)
+# [E] 費用統計功能
 def handle_management_stat(text: str) -> str:
     """處理 統計 [人名] [月份] 指令"""
     parts = text.split()
@@ -439,7 +440,7 @@ def handle_management_stat(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [F] 刪除功能 (已完成)
+# [F] 刪除功能
 def handle_management_delete(text: str) -> str:
     """處理 刪除 地點/人名/紀錄 指令"""
     parts = text.split()
