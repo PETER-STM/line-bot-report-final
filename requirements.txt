@@ -1,0 +1,4 @@
+Flask
+line-bot-sdk
+psycopg2-binary
+gunicorn  # 推薦在生產環境中使用的 WSGI 伺服器
