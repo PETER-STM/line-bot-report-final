@@ -12,11 +12,10 @@ from psycopg2 import sql
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 DATABASE_URL = os.getenv('DATABASE_URL')
-COMPANY_NAME = os.getenv('COMPANY_NAME', '公司') # 用於紀錄公司攤提的名稱
+COMPANY_NAME = os.getenv('COMPANY_NAME', 'BOSS') # 假設您使用 BOSS 作為公司名
 
 # 初始化 Flask App 和 LINE BOT API
 app = Flask(__name__)
-# 確保所有關鍵變數存在
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and DATABASE_URL):
     app.logger.error("關鍵環境變數未設定。請檢查 LINE_CHANNEL_ACCESS_TOKEN/SECRET 和 DATABASE_URL。")
 
@@ -54,7 +53,7 @@ def init_db(force_recreate=False):
                 cur.execute("DROP TABLE IF EXISTS members;")
             # ---------------------------------------------------
                 
-            # 1. 地點設定表 (確保 location_name 存在)
+            # 1. 地點設定表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS locations (
                     location_name VARCHAR(50) PRIMARY KEY,
@@ -82,15 +81,15 @@ def init_db(force_recreate=False):
                 );
             """)
             
-            # 確保 '公司' 作為分攤單位存在於 members 表
+            # 確保 '公司' (BOSS) 作為分攤單位存在於 members 表
             cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (COMPANY_NAME,))
             
-            # 預先插入 '市集' 避免外鍵錯誤 (因為這是在初始化時執行的)
+            # 預先插入 '市集' 避免外鍵錯誤，並給定預設值 (400)
             cur.execute("""
                 INSERT INTO locations (location_name, weekday_cost, weekend_cost)
-                VALUES (%s, 0, 0)
+                VALUES (%s, %s, %s)
                 ON CONFLICT (location_name) DO NOTHING;
-            """, ('市集',))
+            """, ('市集', 400, 400))
             
         conn.commit()
         app.logger.info("資料庫初始化完成或已存在。")
@@ -99,11 +98,8 @@ def init_db(force_recreate=False):
     finally:
         if conn: conn.close()
 
-# 啟動時自動初始化資料庫 (請注意 force_recreate 的值)
-# ❗❗❗ 在您第一次部署此修正版本時，請將參數設為 True 以修復 Schema ❗❗❗
-# ❗❗❗ init_db(force_recreate=True)
-# ❗❗❗ 修復後，請改回 init_db() 避免資料被清除 ❗❗❗
-init_db(force_recreate=True) 
+# 啟動時自動初始化資料庫 (第一次部署時應設為 True，之後改回 False 或不帶參數)
+init_db() 
 
 # --- 3. Webhook 處理 ---
 
@@ -170,6 +166,7 @@ def handle_management_add(text: str) -> str:
                 member_name = parts[1]
                 cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (member_name,))
                 if cur.rowcount > 0:
+                    conn.commit() # <--- 關鍵修復：新增後立即提交
                     return f"✅ 已成功新增成員：{member_name}。"
                 else:
                     return f"💡 成員 {member_name} 已存在。"
@@ -182,6 +179,7 @@ def handle_management_add(text: str) -> str:
                     VALUES (%s, %s, %s)
                     ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
                 """, (loc_name, cost_val, cost_val))
+                conn.commit() # <--- 關鍵修復：新增後立即提交
                 return f"✅ 地點「{loc_name}」已設定成功，平日/假日成本皆為 {cost_val}。"
 
             # 處理：新增 地點 [地點名] [平日成本] [假日成本] (雙費率，共 5 部分)
@@ -195,12 +193,14 @@ def handle_management_add(text: str) -> str:
                     VALUES (%s, %s, %s)
                     ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
                 """, (loc_name, weekday_cost_val, weekend_cost_val))
+                conn.commit() # <--- 關鍵修復：新增後立即提交
                 return f"✅ 地點「{loc_name}」已設定成功，平日 {weekday_cost_val}，假日 {weekend_cost_val}。"
                 
             else:
                 return "❌ 新增指令格式錯誤。\n新增人名 [人名]\n新增 地點 [地點名] [成本](單一)\n新增 地點 [地點名] [平日成本] [假日成本](雙費率)"
 
-        conn.commit()
+        # 這裡的 commit 已無必要，因為前面已處理
+        # conn.commit() 
     except ValueError:
         return "❌ 成本金額必須是數字。"
     except Exception as e:
@@ -267,15 +267,16 @@ def parse_record_command(text: str):
         return None, "日期格式錯誤 (月/日(星期))"
 
     record_date_str = date_match.group(1) 
-    # day_of_week = date_match.group(2) # 實際上用不到，以 date.weekday() 為準
     
     # --- 年份自動判斷優化 ---
     today = date.today()
     current_year = today.year
     input_month = int(record_date_str.split('/')[0])
     
+    # 判斷是否跨年 (例如今天 1 月，輸入 12 月的日期)
     if today.month == 1 and input_month == 12:
         record_year = current_year - 1
+    # 判斷是否為前一年同月份之後的日期
     elif today.month > 1 and input_month > today.month:
         record_year = current_year - 1
     else:
@@ -308,7 +309,7 @@ def parse_record_command(text: str):
 
     return {
         'full_date': full_date,
-        'day_of_week': date_match.group(2), # 雖然不用於計算，但保留以供參考
+        'day_of_week': date_match.group(2), 
         'member_names': member_names,
         'location_name': location_name,
         'manual_cost': manual_cost
@@ -397,7 +398,7 @@ def handle_record_expense(text: str) -> str:
                     group_id
                 ))
             
-        conn.commit()
+        conn.commit() # <--- 關鍵修復：確保所有寫入後，提交！
         
         return f"""✅ 紀錄成功 (v3-final)！總成本 {C}。
 --------------------------------
@@ -509,6 +510,7 @@ def handle_management_delete(text: str) -> str:
                 # B. 使用 group_id 刪除同組所有紀錄 (包括公司攤提)
                 cur.execute("DELETE FROM records WHERE unique_group_id = %s;", (group_id,))
                 
+                conn.commit() # <--- 關鍵修復：刪除後立即提交
                 return f"✅ 已成功刪除 {member_name} 在 {date_part_str} 的紀錄。共刪除 {cur.rowcount} 筆同組紀錄 (含公司攤提)。"
 
             # --- 2. 刪除成員 (刪除 人名 彼) ---
@@ -519,6 +521,7 @@ def handle_management_delete(text: str) -> str:
                     
                 cur.execute("DELETE FROM members WHERE name = %s;", (member_name,))
                 if cur.rowcount > 0:
+                    conn.commit() # <--- 關鍵修復：刪除後立即提交
                     return f"✅ 成員 {member_name} 已從名單中刪除。但歷史費用紀錄將保留。"
                 else:
                     return f"💡 名單中找不到 {member_name}。"
@@ -528,6 +531,7 @@ def handle_management_delete(text: str) -> str:
                 loc_name = parts[2]
                 cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,))
                 if cur.rowcount > 0:
+                    conn.commit() # <--- 關鍵修復：刪除後立即提交
                     return f"✅ 地點 {loc_name} 已成功刪除。"
                 else:
                     return f"💡 地點 {loc_name} 不存在。"
@@ -535,7 +539,8 @@ def handle_management_delete(text: str) -> str:
             else:
                 return "❌ 刪除指令格式錯誤。\n刪除 人名 [人名]\n刪除 地點 [地點名]\n刪除 紀錄 [月/日(星期)] [人名]"
 
-        conn.commit()
+        # 這裡的 commit 已無必要
+        # conn.commit() 
     except Exception as e:
         conn.rollback()
         app.logger.error(f"刪除指令資料庫錯誤: {e}")
@@ -545,7 +550,8 @@ def handle_management_delete(text: str) -> str:
 
 
 # --- 6. 啟動 APP ---
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+# 由於使用 gunicorn 啟動，這裡的 app.run() 區塊應保持註釋或移除。
+# 如果不移除，gunicorn 執行時不會執行它。
+# if __name__ == "__main__":
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(host='0.0.0.0', port=port)
