@@ -54,7 +54,7 @@ def init_db(force_recreate=False):
                 cur.execute("DROP TABLE IF EXISTS projects;") 
                 cur.execute("DROP TABLE IF EXISTS monthly_settlements;") 
                 cur.execute("DROP TABLE IF EXISTS locations;")
-                cur.execute("DROP TABLE IF EXISTS monthly_items;") # 先刪除 locations/monthly_settlements 的外鍵
+                cur.execute("DROP TABLE IF EXISTS monthly_items;") -- 先刪除 locations/monthly_settlements 的外鍵
                 cur.execute("DROP TABLE IF EXISTS members;")
             
             # 4. 月度成本項目設定表 (包含 default_cost)
@@ -103,7 +103,7 @@ def init_db(force_recreate=False):
                     id SERIAL PRIMARY KEY,
                     item_name VARCHAR(50) REFERENCES monthly_items(item_name) ON DELETE RESTRICT,
                     settlement_date DATE NOT NULL, 
-                    cost_amount INTEGER NOT NULL, # 注意：此處儲存的是最終攤提金額
+                    cost_amount INTEGER NOT NULL, -- 修正: 將 # 改為 --
                     actual_members TEXT NOT NULL, 
                     original_msg TEXT,
                     UNIQUE (settlement_date, item_name)
@@ -149,7 +149,8 @@ def init_db(force_recreate=False):
         if conn: conn.close()
 
 # ⚠️ 注意: 若遇到資料庫結構錯誤，請**暫時**將 'False' 改為 'True' 來強制重建，然後再改回 'False'。
-init_db(force_recreate=False) 
+# **建議您第一次運行時，將其改為 True 以強制重建表格，清除舊有錯誤結構。**
+init_db(force_recreate=True) 
 
 # --- 3. Webhook 處理 ---
 @app.route("/callback", methods=['POST'])
