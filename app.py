@@ -45,7 +45,7 @@ def init_db(force_recreate=False):
     try:
         with conn.cursor() as cur:
             
-            # --- ❗ 永久移除強制重建，只在需要時執行 (force_recreate=True) ---
+            # --- ❗ 只有在明確要求時才執行強制重建 (現在已經預設關閉) ---
             if force_recreate:
                 app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格以修正 Schema。資料將遺失。❗❗❗")
                 cur.execute("DROP TABLE IF EXISTS records;")
@@ -121,11 +121,10 @@ def init_db(force_recreate=False):
     finally:
         if conn: conn.close()
 
-# ⚠️ 最終修正：調用時不傳入參數，或傳入 force_recreate=False。
-# 這樣未來任何更新，都不會再刪除您的紀錄。
+# ⚠️ 最終修正：不再傳入 force_recreate=True。資料將被保留。
 init_db(force_recreate=False) 
 
-# --- 3. Webhook 處理 (已加入指令提取邏輯) ---
+# --- 3. Webhook 處理 (包含指令提取與中/英文括號支援) ---
 @app.route("/callback", methods=['POST'])
 def callback():
     """處理 LINE Webhook 傳來的 POST 請求"""
@@ -149,11 +148,11 @@ def handle_message(event):
 
     try:
         # 嘗試從任何位置提取 "日期(星期) [地點] [人名...]" 格式的紀錄指令
-        # 模式：(月/日(星期)) 後面跟著非空白字元
-        record_match = re.search(r'(\d{1,2}/\d{1,2}\(\w\))\s+([^\s]+.*)', original_text)
+        # 【支援中/英文括號】: [\(\（]\w[\)\）]
+        record_match = re.search(r'(\d{1,2}/\d{1,2}[\(\（]\w[\)\）])\s+([^\s]+.*)', original_text)
 
         if original_text.startswith('新增') or original_text.startswith('刪除') or original_text.startswith('清單') or original_text.startswith('統計'):
-            # 對於管理指令，仍然要求精準匹配 (因為這些指令通常需要精準度)
+            # 對於管理指令，仍然要求精準匹配
             text = original_text.split('\n')[0].strip() # 僅取第一行，避免多行訊息干擾
             
             if text.startswith('新增'):
@@ -167,13 +166,12 @@ def handle_message(event):
         elif original_text == '測試':
             response = "Bot 正常運作中！資料庫連接狀態良好。"
         elif record_match:
-            # 提取出核心的紀錄指令部分
-            # record_text 格式應為: 11/11(二) 市集 彼 明
+            # 提取出核心的紀錄指令部分 (日期部分 + 後續內容)
             record_text = record_match.group(1) + " " + record_match.group(2)
             # 將提取出來的指令傳給處理函數
             response = handle_record_expense(record_text)
         else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 地點 人名' (v5-提取模式)。"
+            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 地點 人名' (v5.1-提取模式)。"
             
     except Exception as e:
         app.logger.error(f"處理指令失敗: {e}")
@@ -190,12 +188,13 @@ def handle_message(event):
 
 # --- 4. 核心功能實現 (與前一版本相同) ---
 
-# [C] 日期解析
+# [C] 日期解析 (已修改以處理中/英文括號)
 def parse_record_command(text: str):
     """
     解析費用紀錄指令。格式: [月/日(星期)] [地點名] [人名1] [人名2]... [金額(可選)]
     """
-    date_match = re.match(r'^(\d{1,2}/\d{1,2})\((\w)\)', text)
+    # 【支援中/英文括號】: [\(\（](\w)[\)\）]
+    date_match = re.match(r'^(\d{1,2}/\d{1,2})[\(\（](\w)[\)\）]', text)
     if not date_match:
         return None, "日期格式錯誤 (月/日(星期))"
 
