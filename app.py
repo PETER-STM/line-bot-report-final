@@ -17,18 +17,16 @@ COMPANY_NAME = os.getenv('COMPANY_NAME', 'BOSS') # 公司的名稱/代號
 # 初始化 Flask App 和 LINE BOT API
 app = Flask(__name__)
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and DATABASE_URL):
-    # 僅在非部署環境或測試時可能忽略，部署時必須設定
     app.logger.error("關鍵環境變數未設定。請檢查 LINE_CHANNEL_ACCESS_TOKEN/SECRET 和 DATABASE_URL。")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# --- 2. 資料庫連接與初始化 (V6.5 結構) ---
+# --- 2. 資料庫連接與初始化 (V6.5 結構 - 修正 SQL 註釋) ---
 
 def get_db_connection():
     """建立並返回資料庫連接"""
     try:
-        # 使用連接池或單獨連接
         conn = psycopg2.connect(DATABASE_URL)
         return conn
     except Exception as e:
@@ -97,13 +95,13 @@ def init_db(force_recreate=False):
                 );
             """)
             
-            # 5. 月度成本實際結算表
+            # 5. 月度成本實際結算表 (修復: # 改為 --)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS monthly_settlements (
                     id SERIAL PRIMARY KEY,
                     item_name VARCHAR(50) REFERENCES monthly_items(item_name) ON DELETE RESTRICT,
                     settlement_date DATE NOT NULL, 
-                    cost_amount INTEGER NOT NULL, # 注意：此處儲存的是最終攤提金額
+                    cost_amount INTEGER NOT NULL, -- 注意：此處儲存的是最終攤提金額
                     actual_members TEXT NOT NULL, 
                     original_msg TEXT,
                     UNIQUE (settlement_date, item_name)
@@ -119,7 +117,7 @@ def init_db(force_recreate=False):
                 );
             """)
 
-            # 7. 費用紀錄表
+            # 7. 費用紀錄表 (修復: # 改為 --)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS records (
                     id SERIAL PRIMARY KEY,
@@ -140,16 +138,20 @@ def init_db(force_recreate=False):
             # 確保公司成員存在
             cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (COMPANY_NAME,))
             
+            # --- 預設數據 (如果需要自動初始化，可在此添加) ---
+            # ... 
+            
         conn.commit()
         app.logger.info("資料庫初始化完成或已存在 (V6.5)。")
     except Exception as e:
         conn.rollback()
-        app.logger.error(f"資料庫初始化失敗: {e}")
+        # 由於錯誤訊息中包含 syntax error at or near "#"，我們現在修復了，但還是記錄錯誤
+        app.logger.error(f"資料庫初始化失敗: {e}") 
     finally:
         if conn: conn.close()
 
-# ⚠️ 注意: 若遇到資料庫結構錯誤，請**暫時**將 'False' 改為 'True' 來強制重建，然後再改回 'False'。
-init_db(force_recreate=False) 
+# ⚠️ 注意: 首次部署/修復 Schema 必須設為 True！修復後必須改回 False
+init_db(force_recreate=True) 
 
 # --- 3. Webhook 處理 ---
 @app.route("/callback", methods=['POST'])
@@ -254,7 +256,7 @@ def parse_record_command(text: str):
     
     FILTER_WORDS = ['好', '桌5布4燈1', '架1']
     
-    # 檢查是否以 '標準' 結尾，且該 '標準' 不在 FILTER_WORDS 中 (雖然此處不太可能發生，但保持邏輯清晰)
+    # 檢查是否以 '標準' 結尾
     if temp_text.endswith('標準'):
         is_standard_mode = True
         remaining_text = remaining_text[:-2].strip() # 移除 '標準'
@@ -366,7 +368,7 @@ def handle_record_expense(text: str) -> str:
                     remainder = C_total % total_sharers
                     
                     C_company_final = C_share_per_person + remainder
-                    member_cost_pool = C_total # 為了報表計算方便，這裡記錄 C_total
+                    # member_cost_pool 設為 C_total 方便後續對帳
                     
                     # 寫入 Project 紀錄 (記錄總成本 C_total)
                     cur.execute("""
@@ -420,6 +422,7 @@ def handle_record_expense(text: str) -> str:
                         
                     C_company_final = C_company_stage1 + remainder_members
 
+                    # 寫入 Project 紀錄 (total_fixed_cost 記錄活動成本 C, member_cost_pool 記錄攤給業務員的份額 C_unit_total)
                     cur.execute("""
                         INSERT INTO projects (record_date, location_name, total_fixed_cost, member_cost_pool, original_msg)
                         VALUES (%s, %s, %s, %s, %s) RETURNING project_id;
