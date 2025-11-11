@@ -22,7 +22,7 @@ if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and DATABASE_URL):
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# --- 2. 資料庫連接與初始化 (V6.7 結構) ---
+# --- 2. 資料庫連接與初始化 (V6.8 結構) ---
 
 def get_db_connection():
     """建立並返回資料庫連接"""
@@ -35,7 +35,7 @@ def get_db_connection():
 
 def init_db(force_recreate=False):
     """
-    初始化資料庫表格 (V6.7 結構)。
+    初始化資料庫表格 (V6.8 結構)。
     """
     conn = get_db_connection()
     if not conn:
@@ -139,7 +139,7 @@ def init_db(force_recreate=False):
             cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (COMPANY_NAME,))
             
         conn.commit()
-        app.logger.info("資料庫初始化完成或已存在 (V6.7)。")
+        app.logger.info("資料庫初始化完成或已存在 (V6.8)。")
     except Exception as e:
         conn.rollback()
         app.logger.error(f"資料庫初始化失敗: {e}") 
@@ -166,20 +166,27 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    """處理傳入的文字訊息，並分派給對應的處理函數"""
+    """處理傳入的文字訊息，並分派給對應的處理函數，並過濾雜訊。(V6.8 雜訊過濾)"""
     original_text = event.message.text.strip()
     reply_token = event.reply_token
     response = ""
 
+    # --- V6.8 雜訊過濾機制 ---
+    # 1. 檢查是否為管理指令的起始詞 (避免回覆群組中的一般聊天內容)
+    is_management_command = original_text.startswith(('新增', '刪除', '清單', '統計', '結算', '報表', '覆蓋', '測試'))
+    
+    # 2. 檢查是否為日期開頭的費用紀錄格式
+    # 嚴格匹配 月/日(星期) + 至少一個空格 + 任意內容
+    record_match = re.search(r'(\d{1,2}/\d{1,2}[\(\（]\w[\)\）])\s+([^\s]+.*)', original_text)
+    
+    # 如果不符合任何指令格式，則直接返回，不回覆任何訊息 (靜默過濾雜訊)
+    if not is_management_command and not record_match:
+        return 'OK' 
+
+    # --- 進入指令處理流程 (只處理有指令意圖的訊息) ---
     try:
-        record_match = re.search(r'(\d{1,2}/\d{1,2}[\(\（]\w[\)\）])\s+([^\s]+.*)', original_text)
-        
-        # 處理管理指令
-        if original_text.startswith('新增') or original_text.startswith('刪除') or \
-           original_text.startswith('清單') or original_text.startswith('統計') or \
-           original_text.startswith('結算') or original_text.startswith('報表') or \
-           original_text.startswith('覆蓋'):
-            
+        if is_management_command:
+            # 處理管理指令
             text = original_text.split('\n')[0].strip() 
             
             if text.startswith('新增 月項目'):
@@ -198,16 +205,18 @@ def handle_message(event):
                 response = handle_report(text)
             elif text.startswith('覆蓋'): 
                 response = handle_location_coverage(text)
+            elif original_text == '測試':
+                response = "Bot 正常運作中！資料庫連接狀態良好。"
             else:
-                response = "無法識別的管理指令。"
-
-        elif original_text == '測試':
-            response = "Bot 正常運作中！資料庫連接狀態良好。"
+                response = "無法識別的管理指令。" # 仍然回覆，因為它以指令詞開頭
+                
         elif record_match:
+            # 處理費用紀錄指令
             record_text = record_match.group(1) + " " + record_match.group(2)
             response = handle_record_expense(record_text)
         else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 人名 地點' (v6.7)。"
+             # 作為最終防線，此行應很少執行
+             response = "無法識別的指令格式。請檢查您的指令是否正確。"
             
     except Exception as e:
         app.logger.error(f"處理指令失敗: {e}")
@@ -221,7 +230,7 @@ def handle_message(event):
         TextSendMessage(text=response)
     )
 
-# --- 4. 核心功能實現 (V6.7 邏輯) ---
+# --- 4. 核心功能實現 (V6.8 邏輯) ---
 
 # [C] 日期解析
 def parse_record_command(text: str):
@@ -253,7 +262,8 @@ def parse_record_command(text: str):
     is_standard_mode = False
     temp_text = remaining_text.lower()
     
-    FILTER_WORDS = ['好', '桌5布4燈1', '架1']
+    # 過濾常見的雜訊詞 (可依群組習慣自訂)
+    FILTER_WORDS = ['好', '桌5布4燈1', '架1', '是的', '可以', 'ok', '沒問題']
     
     # 檢查是否以 '標準' 結尾
     if temp_text.endswith('標準'):
@@ -270,6 +280,7 @@ def parse_record_command(text: str):
     parts = [p for p in remaining_text.split() if p not in FILTER_WORDS] 
     
     if len(parts) < 2:
+        # 在 V6.8 中，只有在 record_match 成功匹配的基礎上才會走到這裡，所以回覆錯誤是合理的
         return None, "請至少指定一位人名和一個地點"
 
     member_names = [parts[0]] 
@@ -308,7 +319,7 @@ def get_location_details(conn, location_name, full_date):
         app.logger.error(f"獲取地點成本失敗: {e}")
         return None
 
-# [D] 費用紀錄功能 (Project-Based V6.7 - 口語化純文字回覆)
+# [D] 費用紀錄功能 (Project-Based V6.8 - 純文字口語化回覆)
 def handle_record_expense(text: str) -> str:
     """處理費用紀錄指令，實作連動地點和平分/標準模式切換。"""
     parsed_data, error = parse_record_command(text)
@@ -393,7 +404,7 @@ def handle_record_expense(text: str) -> str:
                     
                     conn.commit()
                     
-                    # V6.7 口語化純文字回覆
+                    # V6.8 純文字口語化回覆
                     return f"""(完美！) {full_date.strftime('%m/%d')} 的 {location_name} 專案已紀錄囉！
 (金額資訊) 這筆費用很特別：它連動了月固定成本({linked_item_name})，所以總共是 {C_total:,} 元。
 --------------------------------
@@ -444,7 +455,7 @@ def handle_record_expense(text: str) -> str:
                     
                     conn.commit()
                     
-                    # V6.7 口語化純文字回覆
+                    # V6.8 純文字口語化回覆
                     mode_note = " (標準半價)" if is_standard_mode else ""
                     return f"""(搞定！) {full_date.strftime('%m/%d')} 的 {location_name} 專案紀錄完成{mode_note}。
 (金額資訊) 總成本：{C:,} 元，按照標準半價原則分攤。
@@ -643,6 +654,7 @@ def handle_management_add_monthly_item(text: str) -> str:
             action = "更新" if cur.rowcount == 0 else "新增"
             conn.commit()
             
+            # V6.8 純文字口語化回覆
             return f"""✅ 成功{action}月成本項目「{item_name}」。
 --------------------------------
 基礎固定金額: {default_cost:,} 元
@@ -701,12 +713,14 @@ def handle_settle_monthly_cost(text: str) -> str:
                 return "❌ 無法結算。分攤人名單不能為空。"
                 
             current_year = date.today().year
-            if target_month < date.today().month and date.today().month == 12:
+            
+            # 調整跨年月份 (例如 11月詢問 1月，則視為明年 1月)
+            if target_month < date.today().month and (date.today().month >= 11 or date.today().month == 1):
                  current_year += 1
             
             settlement_date = date(current_year, target_month, 1)
 
-            # --- V6.7 自動扣除連動活動已攤提的固定費用 (對帳機制) ---
+            # --- V6.8 自動扣除連動活動已攤提的固定費用 (對帳機制) ---
             cur.execute("SELECT location_name FROM locations WHERE linked_monthly_item = %s;", (item_name,))
             linked_locations = [row[0] for row in cur.fetchall()]
             
@@ -777,6 +791,7 @@ def handle_settle_monthly_cost(text: str) -> str:
             member_list_display = actual_members_str.replace(',', '、')
             deduct_note = f"\n(已自動扣除 {linked_activity_days} 天活動的費用，共 {total_fixed_cost_deducted:,} 元)" if total_fixed_cost_deducted > 0 else ""
             
+            # V6.8 純文字口語化回覆
             return f"""✅ 成功{action} {target_month} 月份月成本結算：『{item_name}』{deduct_note}
 --------------------------------
 最終攤提成本: {final_cost_to_settle:,} 元
@@ -867,7 +882,7 @@ def handle_management_list(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [E] 費用統計功能 (V6.7 - 口語化純文字回覆)
+# [E] 費用統計功能 (V6.8 - 純文字口語化回覆)
 def handle_management_stat(text: str) -> str:
     """處理費用統計指令"""
     parts = text.split()
@@ -905,7 +920,7 @@ def handle_management_stat(text: str) -> str:
             if total_cost is None:
                 return f"✅ {target_name} 在 {target_month} 月份沒有任何費用紀錄。"
             
-            # V6.7 口語化純文字回覆
+            # V6.8 純文字口語化回覆
             action_verb = "需要攤提" if target_name != COMPANY_NAME else "總共支出"
 
             return f"""--- {target_name} {target_month} 月份總費用快報 ---
@@ -970,6 +985,7 @@ def handle_report(text: str) -> str:
 
             report_lines = []
             
+            # 使用 Tab 作為分隔符，方便 Excel/試算表貼上
             header = "日期\t紀錄類型\t項目/地點\t攤提人\t攤提金額\t項目總成本"
             report_lines.append(header)
             
@@ -1119,7 +1135,7 @@ def handle_management_delete(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [K] 地點覆蓋率統計 (V6.7 - 口語化純文字回覆)
+# [K] 地點覆蓋率統計 (V6.8 - 純文字口語化回覆)
 def handle_location_coverage(text: str) -> str:
     """統計該月每個地點在有活動日中的覆蓋率。"""
     parts = text.split()
@@ -1175,7 +1191,7 @@ def handle_location_coverage(text: str) -> str:
                 return f"✅ {target_month} 月份沒有任何活動紀錄（專案）。"
 
             # 4. 彙整結果
-            # V6.7 口語化純文字回覆
+            # V6.8 純文字口語化回覆
             response = f"== {target_month} 月份各地點覆蓋狀況報告 ==\n"
             response += f"本月有紀錄的總活動日數是：{total_activity_days} 天\n"
             response += "---------------------------------\n"
