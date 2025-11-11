@@ -35,7 +35,8 @@ def get_db_connection():
 
 def init_db(force_recreate=False):
     """
-    初始化資料庫表格 (地點、成員、專案、紀錄)
+    初始化資料庫表格 (地點、成員、專案、紀錄)。
+    當 force_recreate=False 時，只會建立不存在的表格 (IF NOT EXISTS)。
     """
     conn = get_db_connection()
     if not conn:
@@ -44,7 +45,7 @@ def init_db(force_recreate=False):
     try:
         with conn.cursor() as cur:
             
-            # --- ❗ 解決 Schema 衝突的方案：強制刪除並重建表格 ---
+            # --- ❗ 永久移除強制重建，只在需要時執行 (force_recreate=True) ---
             if force_recreate:
                 app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格以修正 Schema。資料將遺失。❗❗❗")
                 cur.execute("DROP TABLE IF EXISTS records;")
@@ -69,7 +70,7 @@ def init_db(force_recreate=False):
                 );
             """)
 
-            # 3. 專案/活動表 (New! 追蹤單次固定成本的計算)
+            # 3. 專案/活動表
             cur.execute("""
                 CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; 
                 CREATE TABLE IF NOT EXISTS projects (
@@ -82,7 +83,7 @@ def init_db(force_recreate=False):
                 );
             """)
             
-            # 4. 專案參與成員表 (New!)
+            # 4. 專案參與成員表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS project_members (
                     project_id UUID REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -91,7 +92,7 @@ def init_db(force_recreate=False):
                 );
             """)
 
-            # 5. 費用紀錄表 (紀錄每個成員的最終應攤提金額)
+            # 5. 費用紀錄表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS records (
                     id SERIAL PRIMARY KEY,
@@ -120,10 +121,11 @@ def init_db(force_recreate=False):
     finally:
         if conn: conn.close()
 
-# ⚠️ 步驟 A: 暫時開啟強制重建，以使新的 Schema (projects 表) 生效
-init_db(force_recreate=True) 
+# ⚠️ 最終修正：調用時不傳入參數，或傳入 force_recreate=False。
+# 這樣未來任何更新，都不會再刪除您的紀錄。
+init_db(force_recreate=False) 
 
-# --- 3. Webhook 處理 ---
+# --- 3. Webhook 處理 (已加入指令提取邏輯) ---
 @app.route("/callback", methods=['POST'])
 def callback():
     """處理 LINE Webhook 傳來的 POST 請求"""
@@ -140,42 +142,55 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    text = event.message.text.strip()
+    # 接收到的原始文字，可能包含雜訊
+    original_text = event.message.text.strip()
     reply_token = event.reply_token
-    response = "" # 設置初始響應為空字串
+    response = ""
 
     try:
-        if text.startswith('新增'):
-            response = handle_management_add(text)
-        elif text.startswith('刪除'):
-            response = handle_management_delete(text)
-        elif text.startswith('清單'):
-            response = handle_management_list(text)
-        elif text.startswith('統計'):
-            response = handle_management_stat(text)
-        elif text == '測試':
+        # 嘗試從任何位置提取 "日期(星期) [地點] [人名...]" 格式的紀錄指令
+        # 模式：(月/日(星期)) 後面跟著非空白字元
+        record_match = re.search(r'(\d{1,2}/\d{1,2}\(\w\))\s+([^\s]+.*)', original_text)
+
+        if original_text.startswith('新增') or original_text.startswith('刪除') or original_text.startswith('清單') or original_text.startswith('統計'):
+            # 對於管理指令，仍然要求精準匹配 (因為這些指令通常需要精準度)
+            text = original_text.split('\n')[0].strip() # 僅取第一行，避免多行訊息干擾
+            
+            if text.startswith('新增'):
+                response = handle_management_add(text)
+            elif text.startswith('刪除'):
+                response = handle_management_delete(text)
+            elif text.startswith('清單'):
+                response = handle_management_list(text)
+            elif text.startswith('統計'):
+                response = handle_management_stat(text)
+        elif original_text == '測試':
             response = "Bot 正常運作中！資料庫連接狀態良好。"
-        elif re.match(r'^\d{1,2}/\d{1,2}\(\w\).*', text):
-            response = handle_record_expense(text)
+        elif record_match:
+            # 提取出核心的紀錄指令部分
+            # record_text 格式應為: 11/11(二) 市集 彼 明
+            record_text = record_match.group(1) + " " + record_match.group(2)
+            # 將提取出來的指令傳給處理函數
+            response = handle_record_expense(record_text)
         else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 地點 人名' (v4-Project)。"
+            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 地點 人名' (v5-提取模式)。"
             
     except Exception as e:
         app.logger.error(f"處理指令失敗: {e}")
         response = f"指令處理發生未知錯誤: {e}"
 
-    # ❗ 錯誤防護: 確保 response 不是空字串，防止 LineBotApiError (status_code=400)
+    # ❗ 錯誤防護: 確保 response 不是空字串
     if not response:
-        response = "處理過程中發生未預期的錯誤，請檢查指令格式。"
+        response = "處理過程中發生未預期的錯誤，請檢查指令格式或回報問題。"
 
     line_bot_api.reply_message(
         reply_token,
         TextSendMessage(text=response)
     )
 
-# --- 4. 核心功能實現 ---
+# --- 4. 核心功能實現 (與前一版本相同) ---
 
-# [C] 日期解析 (優化版)
+# [C] 日期解析
 def parse_record_command(text: str):
     """
     解析費用紀錄指令。格式: [月/日(星期)] [地點名] [人名1] [人名2]... [金額(可選)]
@@ -192,9 +207,13 @@ def parse_record_command(text: str):
     input_month = int(record_date_str.split('/')[0])
     
     record_year = current_year
-    if today.month == 1 and input_month == 12 or (today.month > 1 and input_month > today.month):
+    # 假設用戶輸入的月份還沒到 (例如 12月問 1月)，則認為是明年
+    if today.month == 12 and input_month == 1 or (today.month > 1 and input_month < today.month):
+        record_year = current_year + 1
+    # 假設用戶輸入的月份已經過去 (例如 1月問 12月)，則認為是去年
+    elif today.month == 1 and input_month == 12 or (today.month > 1 and input_month > today.month):
         record_year = current_year - 1
-    
+        
     try:
         full_date = datetime.strptime(f'{record_year}/{record_date_str}', '%Y/%m/%d').date()
     except ValueError:
@@ -287,8 +306,12 @@ def handle_record_expense(text: str) -> str:
                 all_business_members = sorted(list(set(current_members) | set(new_members)))
                 
                 N = len(all_business_members)
-                C_member_individual = member_cost_pool // N
-                remainder_members = member_cost_pool % N
+                C_member_individual = 0
+                remainder_members = 0
+
+                if N > 0:
+                    C_member_individual = member_cost_pool // N
+                    remainder_members = member_cost_pool % N
 
                 # 重新計算 BOSS 的最終攤提金額
                 C_company_final = member_cost_pool + remainder_members
@@ -321,7 +344,7 @@ def handle_record_expense(text: str) -> str:
 --------------------------------
 總業務員人數已更新為 {N} 位。
 每位業務員應攤提費用: {C_member_individual}
-{COMPANY_NAME} 應攤提費用: {C_company_final} (固定成本 + 餘數)"""
+{COMPANY_NAME} 應攤提費用: {C_company_final:,} (固定成本 + 餘數)"""
 
 
             # --- 情況 B: 專案不存在 (初次紀錄/Project Lead) ---
@@ -377,7 +400,7 @@ def handle_record_expense(text: str) -> str:
                 
                 return f"""✅ 啟動 {location_name} 專案 ({full_date.strftime('%m/%d')})。總成本 {C}。
 --------------------------------
-公司 ({COMPANY_NAME}) 應攤提費用: {C_company_final}
+公司 ({COMPANY_NAME}) 應攤提費用: {C_company_final:,}
 {N} 位業務員 每人應攤提費用: {C_member_individual}
 💡 後續相同日期/地點的紀錄，請以相同格式輸入，將會自動加入此專案分攤。"""
         
@@ -393,8 +416,8 @@ def handle_record_expense(text: str) -> str:
         return f"❌ 處理費用紀錄發生錯誤: {e}"
     finally:
         if conn: conn.close()
-
-# [A] 新增/更新功能 (已確認邏輯與 commit)
+        
+# [A] 新增/更新功能
 def handle_management_add(text: str) -> str:
     """處理 新增 地點/人名 指令"""
     parts = text.split()
@@ -450,7 +473,7 @@ def handle_management_add(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [B] 清單查詢功能 (需適應新 Schema，暫時沿用舊版)
+# [B] 清單查詢功能
 def handle_management_list(text: str) -> str:
     """處理 清單 人名/地點 指令，查詢並列出設定"""
     parts = text.split()
@@ -495,7 +518,7 @@ def handle_management_list(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [E] 費用統計功能 (需適應新 Schema，暫時沿用舊版)
+# [E] 費用統計功能
 def handle_management_stat(text: str) -> str:
     """處理 統計 [人名/公司] [月份] 指令"""
     parts = text.split()
@@ -545,7 +568,7 @@ def handle_management_stat(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [F] 刪除功能 (需適應新 Schema，暫時沿用舊版)
+# [F] 刪除功能
 def handle_management_delete(text: str) -> str:
     """處理 刪除 地點/人名/紀錄 指令"""
     parts = text.split()
@@ -604,7 +627,7 @@ def handle_management_delete(text: str) -> str:
             # --- 3. 刪除地點 (刪除 地點 市集) ---
             elif len(parts) == 3 and parts[1] == '地點':
                 loc_name = parts[2]
-                # 由於 locations 被 projects 引用，需先檢查是否有專案使用
+                # 由於 locations 被 projects 引用，若刪除會導致 RestrictViolation
                 cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,))
                 if cur.rowcount > 0:
                     conn.commit()
