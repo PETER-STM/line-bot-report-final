@@ -12,7 +12,7 @@ from psycopg2 import sql
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 DATABASE_URL = os.getenv('DATABASE_URL')
-COMPANY_NAME = os.getenv('COMPANY_NAME', 'BOSS') # 公司的名稱/代號
+COMPANY_NAME = os.getenv('COMPANY_NAME', '公司') # 公司的名稱/代號 (已修改為 '公司')
 
 # 初始化 Flask App 和 LINE BOT API
 app = Flask(__name__)
@@ -182,7 +182,7 @@ def handle_message(event):
         if original_text.startswith('新增') or original_text.startswith('刪除') or \
            original_text.startswith('清單') or original_text.startswith('統計') or \
            original_text.startswith('結算') or original_text.startswith('報表') or \
-           original_text.startswith('出席'): # 🌟 新增出席指令判斷
+           original_text.startswith('覆蓋'): # 🌟 新增覆蓋指令判斷
             
             text = original_text.split('\n')[0].strip() 
             
@@ -200,8 +200,8 @@ def handle_message(event):
                 response = handle_settle_monthly_cost(text)
             elif text.startswith('報表'): 
                 response = handle_report(text)
-            elif text.startswith('出席'): # 🌟 新增出席指令分派
-                response = handle_attendance_report(text)
+            elif text.startswith('覆蓋'): # 🌟 新增覆蓋指令分派
+                response = handle_location_coverage(text)
             else:
                 response = "無法識別的管理指令。"
 
@@ -401,7 +401,7 @@ def handle_record_expense(text: str) -> str:
                     return f"""✅ 啟動 {location_name} 專案 ({full_date.strftime('%m/%d')})。
 --------------------------------
 活動成本: {C_activity:,} + 固定成本({linked_item_name}): {C_fixed:,} = 總成本 {C_total:,}。
-由 {len(new_members)} 位業務員和 BOSS 平分 (共 {total_sharers} 份)。
+由 {len(new_members)} 位業務員和 {COMPANY_NAME} 平分 (共 {total_sharers} 份)。
 每人應攤提費用: {C_share_per_person:,}
 {COMPANY_NAME} 攤提: {C_company_final:,} (含餘數 {remainder})
 💡 注意：此費用已包含月固定成本，該項目在月結時將會自動扣除。"""
@@ -492,7 +492,7 @@ def handle_record_expense(text: str) -> str:
                 # 刪除並重寫 Records (確保攤提金額更新)
                 cur.execute("DELETE FROM records WHERE project_id = %s;", (project_id,))
                 
-                # 重寫 BOSS 紀錄
+                # 重寫 COMPANY_NAME 紀錄
                 cur.execute("""
                     INSERT INTO records (record_date, member_name, project_id, monthly_settlement_id, cost_paid, original_msg)
                     VALUES (%s, %s, %s, NULL, %s, %s);
@@ -587,7 +587,7 @@ def handle_management_add(text: str) -> str:
                 """, (loc_name, cost_val, cost_val, linked_item))
                 conn.commit()
                 return f"""✅ 地點「{loc_name}」已設定成功，單次活動成本 {cost_val}，
-並連動月成本項目「{linked_item}」。當日發生時，總成本平分給所有參與者與 BOSS。
+並連動月成本項目「{linked_item}」。當日發生時，總成本平分給所有參與者與 {COMPANY_NAME}。
 💡 欲強制標準分攤 (只攤活動成本)，請在指令末尾加上 **標準**。"""
 
             else:
@@ -1006,7 +1006,7 @@ def handle_report(text: str) -> str:
         return f"❌ 產生報表發生錯誤: {e}"
     finally:
         if conn: conn.close()
-
+        
 # [F] 刪除功能
 def handle_management_delete(text: str) -> str:
     """處理刪除指令"""
@@ -1115,12 +1115,12 @@ def handle_management_delete(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [K] 活動出席統計 (V6.5 新增)
-def handle_attendance_report(text: str) -> str:
-    """統計該月所有成員的出席活動天數和缺席天數。"""
+# [K] 地點覆蓋率統計 (V6.5 修正 - 改為地點維度)
+def handle_location_coverage(text: str) -> str:
+    """統計該月每個地點在有活動日中的覆蓋率。"""
     parts = text.split()
-    if len(parts) != 2 or parts[0] != '出席':
-        return "❌ 出席統計指令格式錯誤。請使用: 出席 [月份 (例如 11月)]。"
+    if len(parts) != 2 or parts[0] != '覆蓋':
+        return "❌ 地點覆蓋率指令格式錯誤。請使用: 覆蓋 [月份 (例如 11月)]。"
 
     month_str = parts[1].replace('月', '').strip()
     
@@ -1135,7 +1135,30 @@ def handle_attendance_report(text: str) -> str:
 
     try:
         with conn.cursor() as cur:
-            # 1. 查詢該月總活動天數 (排除月結算紀錄)
+            # 1. 查詢該月所有有活動紀錄的地點
+            cur.execute("""
+                SELECT location_name FROM locations
+                ORDER BY location_name;
+            """)
+            all_locations = [row[0] for row in cur.fetchall()]
+
+            if not all_locations:
+                return "✅ 目前沒有任何已設定的地點，無法統計覆蓋率。"
+
+            # 2. 查詢該月每個地點被紀錄的天數
+            cur.execute("""
+                SELECT 
+                    p.location_name, 
+                    COUNT(DISTINCT p.record_date) AS days_covered
+                FROM projects p
+                WHERE date_part('month', p.record_date) = %s
+                GROUP BY p.location_name
+                ORDER BY p.location_name;
+            """, (target_month,))
+            
+            coverage_data = {row[0]: row[1] for row in cur.fetchall()}
+
+            # 3. 查詢該月總活動天數 (所有地點加總，但需先篩選出所有不重複的日期)
             cur.execute("""
                 SELECT COUNT(DISTINCT record_date)
                 FROM projects
@@ -1147,40 +1170,26 @@ def handle_attendance_report(text: str) -> str:
             if total_activity_days == 0:
                 return f"✅ {target_month} 月份沒有任何活動紀錄（專案）。"
 
-            # 2. 查詢所有業務員 (排除 COMPANY_NAME)
-            cur.execute("SELECT name FROM members WHERE name != %s ORDER BY name;", (COMPANY_NAME,))
-            all_members = [row[0] for row in cur.fetchall()]
-            
-            # 3. 查詢該月每位成員的出席天數
-            cur.execute("""
-                SELECT 
-                    pm.member_name, 
-                    COUNT(DISTINCT p.record_date) AS days_attended
-                FROM project_members pm
-                JOIN projects p ON pm.project_id = p.project_id
-                WHERE date_part('month', p.record_date) = %s
-                GROUP BY pm.member_name
-                ORDER BY pm.member_name;
-            """, (target_month,))
-            
-            attendance_data = {row[0]: row[1] for row in cur.fetchall()}
-
             # 4. 彙整結果
-            response = f"📋 **{target_month} 月份活動出席統計 (共 {total_activity_days} 天)**\n"
+            response = f"📋 **{target_month} 月份 地點覆蓋率統計**\n"
+            response += f"該月總活動日數（有紀錄日）：**{total_activity_days}** 天\n"
+            response += "---------------------------------\n"
             
-            for member in all_members:
-                days_attended = attendance_data.get(member, 0)
-                days_absent = total_activity_days - days_attended
+            for location in all_locations:
+                days_covered = coverage_data.get(location, 0)
                 
-                response += f"• **{member}**: 去 {days_attended} 天 / 不去 {days_absent} 天\n"
+                # 「無紀錄天數」：該地點在所有有活動的日子中，有多少天是沒有該地點紀錄的
+                days_not_covered = total_activity_days - days_covered 
+                
+                response += f"• **{location}**: 有紀錄 {days_covered} 天 / 無紀錄 {days_not_covered} 天\n"
             
-            response += f"\n(註: 此統計不包含 {COMPANY_NAME}，也不計入月成本結算日。)"
+            response += "\n(註: 無紀錄天數 = 該地點在**所有有活動紀錄的日子**中缺席的天數)"
 
             return response.strip()
 
     except Exception as e:
-        app.logger.error(f"出席統計資料庫錯誤: {e}")
-        return f"❌ 查詢出席統計發生錯誤: {e}"
+        app.logger.error(f"地點覆蓋率資料庫錯誤: {e}")
+        return f"❌ 查詢地點覆蓋率發生錯誤: {e}"
     finally:
         if conn: conn.close()
 
