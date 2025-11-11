@@ -98,7 +98,7 @@ def init_db(force_recreate=False):
     finally:
         if conn: conn.close()
 
-# ⚠️ 步驟 1: 暫時開啟強制重建，以使 ON DELETE CASCADE 生效
+# ⚠️ 步驟 A: 暫時開啟強制重建，以使 ON DELETE CASCADE 生效
 init_db(force_recreate=True) 
 
 # --- 3. Webhook 處理 ---
@@ -208,7 +208,7 @@ def handle_management_add(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [B] 清單查詢功能 (略)
+# [B] 清單查詢功能
 def handle_management_list(text: str) -> str:
     """處理 清單 人名/地點 指令，查詢並列出設定"""
     parts = text.split()
@@ -253,7 +253,7 @@ def handle_management_list(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [C] 日期解析 (優化版) (略)
+# [C] 日期解析 (優化版)
 def parse_record_command(text: str):
     """
     解析費用紀錄指令，並自動判斷年份 (假設紀錄是發生在過去 12 個月內)。
@@ -309,7 +309,7 @@ def parse_record_command(text: str):
         'manual_cost': manual_cost
     }, None
 
-# [D] 費用紀錄功能 (兩階段分攤邏輯) (略)
+# [D] 費用紀錄功能 (兩階段分攤邏輯)
 def handle_record_expense(text: str) -> str:
     """處理費用紀錄指令，實作兩階段分攤邏輯。"""
     parsed_data, error = parse_record_command(text)
@@ -416,7 +416,7 @@ def handle_record_expense(text: str) -> str:
         if conn: conn.close()
 
 
-# [E] 費用統計功能 (略)
+# [E] 費用統計功能
 def handle_management_stat(text: str) -> str:
     """處理 統計 [人名/公司] [月份] 指令"""
     parts = text.split()
@@ -465,7 +465,7 @@ def handle_management_stat(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [F] 刪除功能 (修復: 刪除後立即提交)
+# [F] 刪除功能
 def handle_management_delete(text: str) -> str:
     """處理 刪除 地點/人名/紀錄 指令"""
     parts = text.split()
@@ -501,7 +501,7 @@ def handle_management_delete(text: str) -> str:
 
                 group_id = group_id_result[0]
 
-                # B. 使用 group_id 刪除同組所有紀錄 (ON DELETE CASCADE 會確保 member/location 刪除時記錄也會被刪，這裡是刪除同組交易)
+                # B. 使用 group_id 刪除同組所有紀錄
                 cur.execute("DELETE FROM records WHERE unique_group_id = %s;", (group_id,))
                 
                 conn.commit()
@@ -513,10 +513,10 @@ def handle_management_delete(text: str) -> str:
                 if member_name == COMPANY_NAME:
                     return f"❌ 無法刪除系統專用成員 {COMPANY_NAME}。"
                     
+                # 由於 ON DELETE CASCADE，刪除成員會自動刪除相關紀錄
                 cur.execute("DELETE FROM members WHERE name = %s;", (member_name,))
                 if cur.rowcount > 0:
                     conn.commit()
-                    # 由於使用了 ON DELETE CASCADE，相關的 records 紀錄也已經被刪除。
                     return f"✅ 成員 {member_name} 已從名單中刪除。所有相關費用紀錄也已同步清除。" 
                 else:
                     return f"💡 名單中找不到 {member_name}。"
@@ -524,10 +524,10 @@ def handle_management_delete(text: str) -> str:
             # --- 3. 刪除地點 (刪除 地點 市集) ---
             elif len(parts) == 3 and parts[1] == '地點':
                 loc_name = parts[2]
+                # 由於 ON DELETE CASCADE，刪除地點會自動刪除相關紀錄
                 cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,))
                 if cur.rowcount > 0:
                     conn.commit()
-                    # 由於使用了 ON DELETE CASCADE，相關的 records 紀錄也已經被刪除。
                     return f"✅ 地點 {loc_name} 已成功刪除。所有相關費用紀錄也已同步清除。"
                 else:
                     return f"💡 地點 {loc_name} 不存在。"
@@ -537,6 +537,7 @@ def handle_management_delete(text: str) -> str:
 
     except Exception as e:
         conn.rollback()
+        # 由於我們增加了 ON DELETE CASCADE，如果再次出現這個錯誤，則說明重建未成功。
         app.logger.error(f"刪除指令資料庫錯誤: {e}")
         return f"❌ 資料庫操作失敗: {e}"
     finally:
@@ -544,7 +545,4 @@ def handle_management_delete(text: str) -> str:
 
 
 # --- 6. 啟動 APP ---
-# 這裡保持為空的 if __name__ == "__main__" 塊，確保 gunicorn 正確啟動服務。
-# if __name__ == "__main__":
-#     port = int(os.environ.get("PORT", 5000))
-#     app.run(host='0.0.0.0', port=port)
+# (此處保持為空，因為使用 gunicorn 啟動)
