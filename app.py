@@ -22,7 +22,7 @@ if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and DATABASE_URL):
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# --- 2. 資料庫連接與初始化 (V6.5 結構 - 修正 SQL 註釋) ---
+# --- 2. 資料庫連接與初始化 (V6.7 結構) ---
 
 def get_db_connection():
     """建立並返回資料庫連接"""
@@ -35,7 +35,7 @@ def get_db_connection():
 
 def init_db(force_recreate=False):
     """
-    初始化資料庫表格 (V6.5 結構)。
+    初始化資料庫表格 (V6.7 結構)。
     """
     conn = get_db_connection()
     if not conn:
@@ -45,17 +45,17 @@ def init_db(force_recreate=False):
         with conn.cursor() as cur:
             
             if force_recreate:
-                app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格以修正 Schema。資料將遺失。❗❗❗")
+                app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格。資料將遺失。❗❗❗")
                 # 依賴順序刪除
                 cur.execute("DROP TABLE IF EXISTS records;")
                 cur.execute("DROP TABLE IF EXISTS project_members;")
                 cur.execute("DROP TABLE IF EXISTS projects;") 
                 cur.execute("DROP TABLE IF EXISTS monthly_settlements;") 
                 cur.execute("DROP TABLE IF EXISTS locations;")
-                cur.execute("DROP TABLE IF EXISTS monthly_items;") # 先刪除 locations/monthly_settlements 的外鍵
+                cur.execute("DROP TABLE IF EXISTS monthly_items;") 
                 cur.execute("DROP TABLE IF EXISTS members;")
             
-            # 4. 月度成本項目設定表 (包含 default_cost)
+            # 4. 月度成本項目設定表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS monthly_items (
                     item_name VARCHAR(50) PRIMARY KEY,
@@ -65,7 +65,7 @@ def init_db(force_recreate=False):
                 );
             """)
             
-            # 1. 地點設定表 (包含 linked_monthly_item 外鍵)
+            # 1. 地點設定表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS locations (
                     location_name VARCHAR(50) PRIMARY KEY,
@@ -95,13 +95,13 @@ def init_db(force_recreate=False):
                 );
             """)
             
-            # 5. 月度成本實際結算表 (修復: # 改為 --)
+            # 5. 月度成本實際結算表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS monthly_settlements (
                     id SERIAL PRIMARY KEY,
                     item_name VARCHAR(50) REFERENCES monthly_items(item_name) ON DELETE RESTRICT,
                     settlement_date DATE NOT NULL, 
-                    cost_amount INTEGER NOT NULL, -- 注意：此處儲存的是最終攤提金額
+                    cost_amount INTEGER NOT NULL, 
                     actual_members TEXT NOT NULL, 
                     original_msg TEXT,
                     UNIQUE (settlement_date, item_name)
@@ -117,7 +117,7 @@ def init_db(force_recreate=False):
                 );
             """)
 
-            # 7. 費用紀錄表 (修復: # 改為 --)
+            # 7. 費用紀錄表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS records (
                     id SERIAL PRIMARY KEY,
@@ -138,14 +138,10 @@ def init_db(force_recreate=False):
             # 確保公司成員存在
             cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (COMPANY_NAME,))
             
-            # --- 預設數據 (如果需要自動初始化，可在此添加) ---
-            # ... 
-            
         conn.commit()
-        app.logger.info("資料庫初始化完成或已存在 (V6.5)。")
+        app.logger.info("資料庫初始化完成或已存在 (V6.7)。")
     except Exception as e:
         conn.rollback()
-        # 由於錯誤訊息中包含 syntax error at or near "#"，我們現在修復了，但還是記錄錯誤
         app.logger.error(f"資料庫初始化失敗: {e}") 
     finally:
         if conn: conn.close()
@@ -182,7 +178,7 @@ def handle_message(event):
         if original_text.startswith('新增') or original_text.startswith('刪除') or \
            original_text.startswith('清單') or original_text.startswith('統計') or \
            original_text.startswith('結算') or original_text.startswith('報表') or \
-           original_text.startswith('覆蓋'): # 🌟 新增覆蓋指令判斷
+           original_text.startswith('覆蓋'):
             
             text = original_text.split('\n')[0].strip() 
             
@@ -200,7 +196,7 @@ def handle_message(event):
                 response = handle_settle_monthly_cost(text)
             elif text.startswith('報表'): 
                 response = handle_report(text)
-            elif text.startswith('覆蓋'): # 🌟 新增覆蓋指令分派
+            elif text.startswith('覆蓋'): 
                 response = handle_location_coverage(text)
             else:
                 response = "無法識別的管理指令。"
@@ -211,7 +207,7 @@ def handle_message(event):
             record_text = record_match.group(1) + " " + record_match.group(2)
             response = handle_record_expense(record_text)
         else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 人名 地點' (v6.5)。"
+            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 人名 地點' (v6.7)。"
             
     except Exception as e:
         app.logger.error(f"處理指令失敗: {e}")
@@ -225,9 +221,9 @@ def handle_message(event):
         TextSendMessage(text=response)
     )
 
-# --- 4. 核心功能實現 (V6.5 邏輯) ---
+# --- 4. 核心功能實現 (V6.7 邏輯) ---
 
-# [C] 日期解析 (V6.5 修正: 新增 is_standard_mode 標記)
+# [C] 日期解析
 def parse_record_command(text: str):
     """解析費用紀錄指令，檢查是否包含 '標準' 標籤或手動金額。"""
     date_match = re.match(r'^(\d{1,2}/\d{1,2})[\(\（](\w)[\)\）]', text)
@@ -253,7 +249,7 @@ def parse_record_command(text: str):
     
     remaining_text = text[date_match.end():].strip() 
     
-    # 1. 檢查 '標準' 關鍵字 (V6.5 新增)
+    # 1. 檢查 '標準' 關鍵字 
     is_standard_mode = False
     temp_text = remaining_text.lower()
     
@@ -291,7 +287,7 @@ def parse_record_command(text: str):
         'member_names': member_names,
         'location_name': location_name,
         'manual_cost': manual_cost,
-        'is_standard_mode': is_standard_mode # 🌟 V6.5 回傳是否為標準模式
+        'is_standard_mode': is_standard_mode
     }, None
 
 # 輔助函數: 獲取地點成本與連動項目
@@ -312,7 +308,7 @@ def get_location_details(conn, location_name, full_date):
         app.logger.error(f"獲取地點成本失敗: {e}")
         return None
 
-# [D] 費用紀錄功能 (Project-Based V6.5 修正 - 處理 '標準' 模式)
+# [D] 費用紀錄功能 (Project-Based V6.7 - 口語化純文字回覆)
 def handle_record_expense(text: str) -> str:
     """處理費用紀錄指令，實作連動地點和平分/標準模式切換。"""
     parsed_data, error = parse_record_command(text)
@@ -323,7 +319,7 @@ def handle_record_expense(text: str) -> str:
     new_members = parsed_data['member_names'] 
     location_name = parsed_data['location_name']
     manual_cost = parsed_data['manual_cost']
-    is_standard_mode = parsed_data['is_standard_mode'] # 🌟 V6.5: 獲取模式
+    is_standard_mode = parsed_data['is_standard_mode']
 
     conn = get_db_connection()
     if not conn: return "❌ 資料庫連接失敗。"
@@ -332,7 +328,7 @@ def handle_record_expense(text: str) -> str:
         with conn.cursor() as cur:
             # 1. 檢查該地點/日期是否已有專案 (Project)
             cur.execute("""
-                SELECT p.project_id, p.total_fixed_cost
+                SELECT p.project_id, p.total_fixed_cost, p.member_cost_pool
                 FROM projects p 
                 WHERE p.record_date = %s AND p.location_name = %s;
             """, (full_date, location_name))
@@ -351,11 +347,11 @@ def handle_record_expense(text: str) -> str:
                 # 如果有手動金額，則覆蓋活動成本 C_activity
                 C_activity = manual_cost if manual_cost is not None else C_activity 
                 
-                # 判斷是否執行連動邏輯：地點有連動項目 AND 不是標準模式 (V6.5 核心)
+                # 判斷是否執行連動邏輯：地點有連動項目 AND 不是標準模式 
                 should_link = linked_item_name and not is_standard_mode
 
                 if should_link:
-                    # --- 核心邏輯 A: 連動月成本地點 (例如 總站) ---
+                    # --- 核心邏輯 A: 連動月成本地點 ---
                     cur.execute("SELECT default_cost FROM monthly_items WHERE item_name = %s;", (linked_item_name,))
                     fixed_cost_data = cur.fetchone()
                     if not fixed_cost_data:
@@ -371,7 +367,6 @@ def handle_record_expense(text: str) -> str:
                     remainder = C_total % total_sharers
                     
                     C_company_final = C_share_per_person + remainder
-                    # member_cost_pool 設為 C_total 方便後續對帳
                     
                     # 寫入 Project 紀錄 (記錄總成本 C_total)
                     cur.execute("""
@@ -398,15 +393,16 @@ def handle_record_expense(text: str) -> str:
                     
                     conn.commit()
                     
-                    return f"""✅ 啟動 {location_name} 專案 ({full_date.strftime('%m/%d')})。
+                    # V6.7 口語化純文字回覆
+                    return f"""(完美！) {full_date.strftime('%m/%d')} 的 {location_name} 專案已紀錄囉！
+(金額資訊) 這筆費用很特別：它連動了月固定成本({linked_item_name})，所以總共是 {C_total:,} 元。
 --------------------------------
-活動成本: {C_activity:,} + 固定成本({linked_item_name}): {C_fixed:,} = 總成本 {C_total:,}。
-由 {len(new_members)} 位業務員和 {COMPANY_NAME} 平分 (共 {total_sharers} 份)。
-每人應攤提費用: {C_share_per_person:,}
-{COMPANY_NAME} 攤提: {C_company_final:,} (含餘數 {remainder})
-💡 注意：此費用已包含月固定成本，該項目在月結時將會自動扣除。"""
+> 攤提結果：由 {len(new_members)} 位業務員 和 {COMPANY_NAME} 共同分攤 (共 {total_sharers} 份)。
+> 每位夥伴應攤提：{C_share_per_person:,} 元
+> {COMPANY_NAME} 負責：{C_company_final:,} 元 (已含餘數 {remainder})
+(小提醒) 月結算時，系統會自動扣除這筆已攤提的固定成本喔！"""
 
-                # --- 核心邏輯 B: 標準地點/標準模式 (無連動月成本 或 啟動標準模式) ---
+                # --- 核心邏輯 B: 標準地點/標準模式 ---
                 else:
                     C = C_activity
                     N = len(new_members)
@@ -425,7 +421,7 @@ def handle_record_expense(text: str) -> str:
                         
                     C_company_final = C_company_stage1 + remainder_members
 
-                    # 寫入 Project 紀錄 (total_fixed_cost 記錄活動成本 C, member_cost_pool 記錄攤給業務員的份額 C_unit_total)
+                    # 寫入 Project 紀錄
                     cur.execute("""
                         INSERT INTO projects (record_date, location_name, total_fixed_cost, member_cost_pool, original_msg)
                         VALUES (%s, %s, %s, %s, %s) RETURNING project_id;
@@ -448,16 +444,18 @@ def handle_record_expense(text: str) -> str:
                     
                     conn.commit()
                     
-                    mode_note = " (標準模式)" if is_standard_mode else ""
-                    return f"""✅ 啟動 {location_name} 專案 ({full_date.strftime('%m/%d')}){mode_note}。總成本 {C:,}。
+                    # V6.7 口語化純文字回覆
+                    mode_note = " (標準半價)" if is_standard_mode else ""
+                    return f"""(搞定！) {full_date.strftime('%m/%d')} 的 {location_name} 專案紀錄完成{mode_note}。
+(金額資訊) 總成本：{C:,} 元，按照標準半價原則分攤。
 --------------------------------
-公司 ({COMPANY_NAME}) 應攤提費用: {C_company_final:,}
-{len(new_members)} 位業務員 每人應攤提費用: {C_member_individual:,}
-💡 後續相同日期/地點的紀錄，請以相同格式輸入，將會自動加入此專案分攤。"""
+> {COMPANY_NAME} 應攤提：{C_company_final:,} 元
+> {len(new_members)} 位夥伴 每人應攤提：{C_member_individual:,} 元
+(下一步) 如果有其他夥伴同一天也去此地點，請直接以相同格式輸入，系統會自動更新分攤名單喔！"""
 
-            # --- 情況 A: 專案已存在 (只處理加入成員，攤提邏輯不變) ---
+            # --- 情況 A: 專案已存在 (只處理加入成員) ---
             else:
-                project_id, total_fixed_cost = project_data
+                project_id, total_fixed_cost, member_cost_pool = project_data
                 
                 cur.execute("""
                     SELECT member_name FROM project_members WHERE project_id = %s;
@@ -588,7 +586,7 @@ def handle_management_add(text: str) -> str:
                 conn.commit()
                 return f"""✅ 地點「{loc_name}」已設定成功，單次活動成本 {cost_val}，
 並連動月成本項目「{linked_item}」。當日發生時，總成本平分給所有參與者與 {COMPANY_NAME}。
-💡 欲強制標準分攤 (只攤活動成本)，請在指令末尾加上 **標準**。"""
+💡 欲強制標準分攤 (只攤活動成本)，請在指令末尾加上 標準。"""
 
             else:
                 return "❌ 新增 地點/人名 指令格式錯誤。\n新增人名 [人名]\n新增 地點 [地點名] [成本](單一/標準)\n新增 地點 [地點名] [成本] 連動 [月項目名](連動)"
@@ -708,7 +706,7 @@ def handle_settle_monthly_cost(text: str) -> str:
             
             settlement_date = date(current_year, target_month, 1)
 
-            # --- V6.5/V6.4 自動扣除連動活動已攤提的固定費用 (對帳機制) ---
+            # --- V6.7 自動扣除連動活動已攤提的固定費用 (對帳機制) ---
             cur.execute("SELECT location_name FROM locations WHERE linked_monthly_item = %s;", (item_name,))
             linked_locations = [row[0] for row in cur.fetchall()]
             
@@ -814,7 +812,7 @@ def handle_management_list(text: str) -> str:
                 members = [row[0] for row in cur.fetchall()]
                 if not members: return "📋 目前沒有任何已設定的人名或業務員。"
                 member_list_str = "、".join(members)
-                return f"📋 **現有成員 (業務員/公司):**\n{member_list_str}"
+                return f"📋 現有成員 (業務員/公司): {member_list_str}"
 
             elif list_type == '地點':
                 cur.execute("SELECT location_name, weekday_cost, weekend_cost, linked_monthly_item FROM locations ORDER BY location_name;")
@@ -822,14 +820,14 @@ def handle_management_list(text: str) -> str:
                 
                 if not locations: return "📋 目前沒有任何已設定的地點。"
 
-                response = "📋 **現有地點及其成本:**\n"
+                response = "📋 現有地點及其成本:\n"
                 for name, weekday_cost, weekend_cost, linked_item in locations:
                     linked_str = f" [連動: {linked_item}]" if linked_item else ""
                     if weekday_cost == weekend_cost:
-                        response += f"• {name}: {weekday_cost} (單一費率){linked_str}\n"
+                        response += f"- {name}: {weekday_cost} (單一費率){linked_str}\n"
                     else:
-                        response += f"• {name}: 平日 {weekday_cost} / 假日 {weekend_cost}{linked_str}\n"
-                response += "\n💡 紀錄時加 **標準** 可強制標準分攤。"
+                        response += f"- {name}: 平日 {weekday_cost} / 假日 {weekend_cost}{linked_str}\n"
+                response += "\n💡 紀錄時加 標準 可強制標準分攤。"
                 return response.strip()
 
             elif list_type == '月項目': 
@@ -838,10 +836,10 @@ def handle_management_list(text: str) -> str:
                 
                 if not monthly_items: return "📋 目前沒有任何已設定的月度成本項目。"
 
-                response = "📋 **現有月度成本項目 (固定費用/預設分攤):**\n"
+                response = "📋 現有月度成本項目 (固定費用/預設分攤):\n"
                 for item_name, default_cost, default_members in monthly_items:
                     members = default_members.replace(',', '、')
-                    response += f"• {item_name}: 基礎費用 {default_cost:,} (預設人: {members}、{COMPANY_NAME})\n"
+                    response += f"- {item_name}: 基礎費用 {default_cost:,} (預設人: {members}、{COMPANY_NAME})\n"
                 return response.strip()
 
             elif list_type == '月結算':
@@ -854,10 +852,10 @@ def handle_management_list(text: str) -> str:
                 
                 if not monthly_settlements: return "📋 目前沒有任何月度成本結算紀錄。"
 
-                response = "📋 **現有月度成本結算紀錄 (實際攤提金額):**\n"
+                response = "📋 現有月度成本結算紀錄 (實際攤提金額):\n"
                 for settlement_date, item_name, cost_amount, actual_members in monthly_settlements:
                     members = actual_members.replace(',', '、')
-                    response += f"• {settlement_date.strftime('%Y/%m')} [{item_name}]: {cost_amount:,} 元 (實分人: {members}、{COMPANY_NAME})\n"
+                    response += f"- {settlement_date.strftime('%Y/%m')} [{item_name}]: {cost_amount:,} 元 (實分人: {members}、{COMPANY_NAME})\n"
                 return response.strip()
                 
             else:
@@ -869,7 +867,7 @@ def handle_management_list(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [E] 費用統計功能
+# [E] 費用統計功能 (V6.7 - 口語化純文字回覆)
 def handle_management_stat(text: str) -> str:
     """處理費用統計指令"""
     parts = text.split()
@@ -907,7 +905,13 @@ def handle_management_stat(text: str) -> str:
             if total_cost is None:
                 return f"✅ {target_name} 在 {target_month} 月份沒有任何費用紀錄。"
             
-            return f"📈 **{target_name} {target_month} 月份總費用統計**：\n總攤提費用為：**{total_cost:,}** 元 (含月度成本攤提)。"
+            # V6.7 口語化純文字回覆
+            action_verb = "需要攤提" if target_name != COMPANY_NAME else "總共支出"
+
+            return f"""--- {target_name} {target_month} 月份總費用快報 ---
+在這個月，{target_name} {action_verb} 的費用總額是：
+# {total_cost:,} 元 #
+(此金額包含日常活動和月度固定成本的攤提部分)"""
 
     except Exception as e:
         app.logger.error(f"統計指令資料庫錯誤: {e}")
@@ -994,7 +998,7 @@ def handle_report(text: str) -> str:
             for member, total_cost in summary_data:
                 summary_lines.append(f"{member}\t{total_cost:,}")
 
-            final_report = f"📋 **{target_month} 月份費用明細報表** (請複製以下純文字表格，貼上 Excel/試算表):\n\n"
+            final_report = f"📋 {target_month} 月份費用明細報表 (請複製以下純文字表格，貼上 Excel/試算表):\n\n"
             final_report += "\n".join(report_lines)
             final_report += "\n\n"
             final_report += "\n".join(summary_lines)
@@ -1115,7 +1119,7 @@ def handle_management_delete(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [K] 地點覆蓋率統計 (V6.5 修正 - 改為地點維度)
+# [K] 地點覆蓋率統計 (V6.7 - 口語化純文字回覆)
 def handle_location_coverage(text: str) -> str:
     """統計該月每個地點在有活動日中的覆蓋率。"""
     parts = text.split()
@@ -1171,19 +1175,20 @@ def handle_location_coverage(text: str) -> str:
                 return f"✅ {target_month} 月份沒有任何活動紀錄（專案）。"
 
             # 4. 彙整結果
-            response = f"📋 **{target_month} 月份 地點覆蓋率統計**\n"
-            response += f"該月總活動日數（有紀錄日）：**{total_activity_days}** 天\n"
+            # V6.7 口語化純文字回覆
+            response = f"== {target_month} 月份各地點覆蓋狀況報告 ==\n"
+            response += f"本月有紀錄的總活動日數是：{total_activity_days} 天\n"
             response += "---------------------------------\n"
             
             for location in all_locations:
                 days_covered = coverage_data.get(location, 0)
-                
-                # 「無紀錄天數」：該地點在所有有活動的日子中，有多少天是沒有該地點紀錄的
                 days_not_covered = total_activity_days - days_covered 
                 
-                response += f"• **{location}**: 有紀錄 {days_covered} 天 / 無紀錄 {days_not_covered} 天\n"
+                response += f"[地點] {location}:\n"
+                response += f"   - 去了 (有紀錄)：{days_covered} 天\n"
+                response += f"   - 沒去 (缺席)：{days_not_covered} 天\n"
             
-            response += "\n(註: 無紀錄天數 = 該地點在**所有有活動紀錄的日子**中缺席的天數)"
+            response += "\n(註: 「沒去」是指該地點在其他地點有活動的日子中未被覆蓋的天數)"
 
             return response.strip()
 
