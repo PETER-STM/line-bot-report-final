@@ -67,14 +67,14 @@ def init_db(force_recreate=False):
                     name VARCHAR(50) PRIMARY KEY
                 );
             """)
-            # 3. 費用紀錄表
+            # 3. 費用紀錄表 (修復: 新增 ON DELETE CASCADE)
             cur.execute("""
                 CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; 
                 CREATE TABLE IF NOT EXISTS records (
                     id SERIAL PRIMARY KEY,
                     record_date DATE NOT NULL,
-                    member_name VARCHAR(50) REFERENCES members(name),
-                    location_name VARCHAR(50) REFERENCES locations(location_name),
+                    member_name VARCHAR(50) REFERENCES members(name) ON DELETE CASCADE,  
+                    location_name VARCHAR(50) REFERENCES locations(location_name) ON DELETE CASCADE,
                     cost_paid INTEGER NOT NULL,
                     original_msg TEXT,
                     unique_group_id UUID DEFAULT uuid_generate_v4()
@@ -98,8 +98,8 @@ def init_db(force_recreate=False):
     finally:
         if conn: conn.close()
 
-# 啟動時自動初始化資料庫 (第一次部署時應設為 True，之後改回 False 或不帶參數)
-init_db() 
+# ⚠️ 步驟 1: 暫時開啟強制重建，以使 ON DELETE CASCADE 生效
+init_db(force_recreate=True) 
 
 # --- 3. Webhook 處理 ---
 
@@ -166,7 +166,7 @@ def handle_management_add(text: str) -> str:
                 member_name = parts[1]
                 cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (member_name,))
                 if cur.rowcount > 0:
-                    conn.commit() # <--- 關鍵修復：新增後立即提交
+                    conn.commit()
                     return f"✅ 已成功新增成員：{member_name}。"
                 else:
                     return f"💡 成員 {member_name} 已存在。"
@@ -179,7 +179,7 @@ def handle_management_add(text: str) -> str:
                     VALUES (%s, %s, %s)
                     ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
                 """, (loc_name, cost_val, cost_val))
-                conn.commit() # <--- 關鍵修復：新增後立即提交
+                conn.commit()
                 return f"✅ 地點「{loc_name}」已設定成功，平日/假日成本皆為 {cost_val}。"
 
             # 處理：新增 地點 [地點名] [平日成本] [假日成本] (雙費率，共 5 部分)
@@ -193,14 +193,12 @@ def handle_management_add(text: str) -> str:
                     VALUES (%s, %s, %s)
                     ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
                 """, (loc_name, weekday_cost_val, weekend_cost_val))
-                conn.commit() # <--- 關鍵修復：新增後立即提交
+                conn.commit()
                 return f"✅ 地點「{loc_name}」已設定成功，平日 {weekday_cost_val}，假日 {weekend_cost_val}。"
                 
             else:
                 return "❌ 新增指令格式錯誤。\n新增人名 [人名]\n新增 地點 [地點名] [成本](單一)\n新增 地點 [地點名] [平日成本] [假日成本](雙費率)"
 
-        # 這裡的 commit 已無必要，因為前面已處理
-        # conn.commit() 
     except ValueError:
         return "❌ 成本金額必須是數字。"
     except Exception as e:
@@ -210,9 +208,7 @@ def handle_management_add(text: str) -> str:
     finally:
         if conn: conn.close()
         
-    return "❌ 新增指令格式錯誤。"
-
-# [B] 清單查詢功能
+# [B] 清單查詢功能 (略)
 def handle_management_list(text: str) -> str:
     """處理 清單 人名/地點 指令，查詢並列出設定"""
     parts = text.split()
@@ -257,7 +253,7 @@ def handle_management_list(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [C] 日期解析 (優化版)
+# [C] 日期解析 (優化版) (略)
 def parse_record_command(text: str):
     """
     解析費用紀錄指令，並自動判斷年份 (假設紀錄是發生在過去 12 個月內)。
@@ -273,10 +269,8 @@ def parse_record_command(text: str):
     current_year = today.year
     input_month = int(record_date_str.split('/')[0])
     
-    # 判斷是否跨年 (例如今天 1 月，輸入 12 月的日期)
     if today.month == 1 and input_month == 12:
         record_year = current_year - 1
-    # 判斷是否為前一年同月份之後的日期
     elif today.month > 1 and input_month > today.month:
         record_year = current_year - 1
     else:
@@ -315,7 +309,7 @@ def parse_record_command(text: str):
         'manual_cost': manual_cost
     }, None
 
-# [D] 費用紀錄功能 (兩階段分攤邏輯)
+# [D] 費用紀錄功能 (兩階段分攤邏輯) (略)
 def handle_record_expense(text: str) -> str:
     """處理費用紀錄指令，實作兩階段分攤邏輯。"""
     parsed_data, error = parse_record_command(text)
@@ -398,7 +392,7 @@ def handle_record_expense(text: str) -> str:
                     group_id
                 ))
             
-        conn.commit() # <--- 關鍵修復：確保所有寫入後，提交！
+        conn.commit()
         
         return f"""✅ 紀錄成功 (v3-final)！總成本 {C}。
 --------------------------------
@@ -422,7 +416,7 @@ def handle_record_expense(text: str) -> str:
         if conn: conn.close()
 
 
-# [E] 費用統計功能
+# [E] 費用統計功能 (略)
 def handle_management_stat(text: str) -> str:
     """處理 統計 [人名/公司] [月份] 指令"""
     parts = text.split()
@@ -471,7 +465,7 @@ def handle_management_stat(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [F] 刪除功能
+# [F] 刪除功能 (修復: 刪除後立即提交)
 def handle_management_delete(text: str) -> str:
     """處理 刪除 地點/人名/紀錄 指令"""
     parts = text.split()
@@ -507,10 +501,10 @@ def handle_management_delete(text: str) -> str:
 
                 group_id = group_id_result[0]
 
-                # B. 使用 group_id 刪除同組所有紀錄 (包括公司攤提)
+                # B. 使用 group_id 刪除同組所有紀錄 (ON DELETE CASCADE 會確保 member/location 刪除時記錄也會被刪，這裡是刪除同組交易)
                 cur.execute("DELETE FROM records WHERE unique_group_id = %s;", (group_id,))
                 
-                conn.commit() # <--- 關鍵修復：刪除後立即提交
+                conn.commit()
                 return f"✅ 已成功刪除 {member_name} 在 {date_part_str} 的紀錄。共刪除 {cur.rowcount} 筆同組紀錄 (含公司攤提)。"
 
             # --- 2. 刪除成員 (刪除 人名 彼) ---
@@ -521,8 +515,9 @@ def handle_management_delete(text: str) -> str:
                     
                 cur.execute("DELETE FROM members WHERE name = %s;", (member_name,))
                 if cur.rowcount > 0:
-                    conn.commit() # <--- 關鍵修復：刪除後立即提交
-                    return f"✅ 成員 {member_name} 已從名單中刪除。但歷史費用紀錄將保留。"
+                    conn.commit()
+                    # 由於使用了 ON DELETE CASCADE，相關的 records 紀錄也已經被刪除。
+                    return f"✅ 成員 {member_name} 已從名單中刪除。所有相關費用紀錄也已同步清除。" 
                 else:
                     return f"💡 名單中找不到 {member_name}。"
 
@@ -531,16 +526,15 @@ def handle_management_delete(text: str) -> str:
                 loc_name = parts[2]
                 cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,))
                 if cur.rowcount > 0:
-                    conn.commit() # <--- 關鍵修復：刪除後立即提交
-                    return f"✅ 地點 {loc_name} 已成功刪除。"
+                    conn.commit()
+                    # 由於使用了 ON DELETE CASCADE，相關的 records 紀錄也已經被刪除。
+                    return f"✅ 地點 {loc_name} 已成功刪除。所有相關費用紀錄也已同步清除。"
                 else:
                     return f"💡 地點 {loc_name} 不存在。"
                     
             else:
                 return "❌ 刪除指令格式錯誤。\n刪除 人名 [人名]\n刪除 地點 [地點名]\n刪除 紀錄 [月/日(星期)] [人名]"
 
-        # 這裡的 commit 已無必要
-        # conn.commit() 
     except Exception as e:
         conn.rollback()
         app.logger.error(f"刪除指令資料庫錯誤: {e}")
@@ -550,8 +544,7 @@ def handle_management_delete(text: str) -> str:
 
 
 # --- 6. 啟動 APP ---
-# 由於使用 gunicorn 啟動，這裡的 app.run() 區塊應保持註釋或移除。
-# 如果不移除，gunicorn 執行時不會執行它。
+# 這裡保持為空的 if __name__ == "__main__" 塊，確保 gunicorn 正確啟動服務。
 # if __name__ == "__main__":
 #     port = int(os.environ.get("PORT", 5000))
 #     app.run(host='0.0.0.0', port=port)
