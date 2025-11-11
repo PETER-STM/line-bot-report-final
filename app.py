@@ -2,7 +2,7 @@ import os
 import re
 from datetime import datetime, date
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
+from linebot import LineBotBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 import psycopg2
@@ -36,7 +36,6 @@ def get_db_connection():
 def init_db(force_recreate=False):
     """
     初始化資料庫表格 (地點、成員、專案、紀錄)。
-    當 force_recreate=False 時，只會建立不存在的表格 (IF NOT EXISTS)。
     """
     conn = get_db_connection()
     if not conn:
@@ -45,7 +44,7 @@ def init_db(force_recreate=False):
     try:
         with conn.cursor() as cur:
             
-            # --- ❗ 永久移除強制重建，只在明確要求時執行 ---
+            # --- 永久移除強制重建，只在明確要求時執行 ---
             if force_recreate:
                 app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格以修正 Schema。資料將遺失。❗❗❗")
                 cur.execute("DROP TABLE IF EXISTS records;")
@@ -53,6 +52,7 @@ def init_db(force_recreate=False):
                 cur.execute("DROP TABLE IF EXISTS projects;") 
                 cur.execute("DROP TABLE IF EXISTS locations;")
                 cur.execute("DROP TABLE IF EXISTS members;")
+                cur.execute("DROP TABLE IF EXISTS monthly_costs;") # 新增
             # ---------------------------------------------------
                 
             # 1. 地點設定表
@@ -61,6 +61,7 @@ def init_db(force_recreate=False):
                     location_name VARCHAR(50) PRIMARY KEY,
                     weekday_cost INTEGER NOT NULL,
                     weekend_cost INTEGER NOT NULL
+                    -- 營業時間相關欄位可在此處新增
                 );
             """)
             # 2. 成員名單表
@@ -70,7 +71,7 @@ def init_db(force_recreate=False):
                 );
             """)
 
-            # 3. 專案/活動表
+            # 3. 專案/活動表 (Project-Based Cost)
             cur.execute("""
                 CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; 
                 CREATE TABLE IF NOT EXISTS projects (
@@ -83,7 +84,19 @@ def init_db(force_recreate=False):
                 );
             """)
             
-            # 4. 專案參與成員表
+            # 4. 月度成本分攤表 (Monthly Fixed Cost)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS monthly_costs (
+                    id SERIAL PRIMARY KEY,
+                    cost_date DATE NOT NULL,
+                    cost_amount INTEGER NOT NULL,
+                    member_list TEXT,
+                    memo TEXT,
+                    UNIQUE (cost_date) -- 確保每月只有一筆紀錄
+                );
+            """)
+            
+            # 5. 專案參與成員表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS project_members (
                     project_id UUID REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -92,15 +105,23 @@ def init_db(force_recreate=False):
                 );
             """)
 
-            # 5. 費用紀錄表
+            # 6. 費用紀錄表
+            # 新增 monthly_cost_id 欄位，允許其為 NULL (用於區分是 Project 紀錄還是 Monthly 紀錄)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS records (
                     id SERIAL PRIMARY KEY,
                     record_date DATE NOT NULL,
                     member_name VARCHAR(50) REFERENCES members(name) ON DELETE CASCADE,
-                    project_id UUID REFERENCES projects(project_id) ON DELETE CASCADE,
+                    project_id UUID REFERENCES projects(project_id) ON DELETE CASCADE NULL,
+                    monthly_cost_id INTEGER REFERENCES monthly_costs(id) ON DELETE CASCADE NULL,
                     cost_paid INTEGER NOT NULL,
-                    original_msg TEXT
+                    original_msg TEXT,
+                    
+                    -- 確保 project_id 和 monthly_cost_id 只有一個有值
+                    CONSTRAINT chk_one_id_not_null CHECK (
+                        (project_id IS NOT NULL AND monthly_cost_id IS NULL) OR 
+                        (project_id IS NULL AND monthly_cost_id IS NOT NULL)
+                    )
                 );
             """)
             
@@ -117,14 +138,14 @@ def init_db(force_recreate=False):
         conn.commit()
         app.logger.info("資料庫初始化完成或已存在。")
     except Exception as e:
+        conn.rollback()
         app.logger.error(f"資料庫初始化失敗: {e}")
     finally:
         if conn: conn.close()
 
-# ⚠️ 最終修正：資料庫初始化，不執行強制重建。
 init_db(force_recreate=False) 
 
-# --- 3. Webhook 處理 (包含指令提取與中/英文括號支援) ---
+# --- 3. Webhook 處理 (已新增月成本指令處理) ---
 @app.route("/callback", methods=['POST'])
 def callback():
     """處理 LINE Webhook 傳來的 POST 請求"""
@@ -141,18 +162,15 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    # 接收到的原始文字，可能包含雜訊
     original_text = event.message.text.strip()
     reply_token = event.reply_token
     response = ""
 
     try:
-        # 嘗試從任何位置提取 "日期(星期) [地點] [人名...]" 格式的核心指令
-        # 【支援中/英文括號】: [\(\（]\w[\)\）]
         record_match = re.search(r'(\d{1,2}/\d{1,2}[\(\（]\w[\)\）])\s+([^\s]+.*)', original_text)
-
-        if original_text.startswith('新增') or original_text.startswith('刪除') or original_text.startswith('清單') or original_text.startswith('統計'):
-            # 對於管理指令，仍然要求精準匹配
+        
+        # 處理管理指令 (新增月成本)
+        if original_text.startswith('新增') or original_text.startswith('刪除') or original_text.startswith('清單') or original_text.startswith('統計') or original_text.startswith('月成本'):
             text = original_text.split('\n')[0].strip() 
             
             if text.startswith('新增'):
@@ -163,21 +181,20 @@ def handle_message(event):
                 response = handle_management_list(text)
             elif text.startswith('統計'):
                 response = handle_management_stat(text)
+            elif text.startswith('月成本'):
+                response = handle_monthly_cost(text) # 🌟 新增的月成本處理函數
         elif original_text == '測試':
             response = "Bot 正常運作中！資料庫連接狀態良好。"
         elif record_match:
-            # 提取出核心的紀錄指令部分 (日期部分 + 後續內容)
             record_text = record_match.group(1) + " " + record_match.group(2)
-            # 將提取出來的指令傳給處理函數
             response = handle_record_expense(record_text)
         else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 人名 地點' (v6-順序修正)。"
+            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 人名 地點' (v6.1)。"
             
     except Exception as e:
         app.logger.error(f"處理指令失敗: {e}")
         response = f"指令處理發生未知錯誤: {e}"
 
-    # ❗ 錯誤防護: 確保 response 不是空字串
     if not response:
         response = "處理過程中發生未預期的錯誤，請檢查指令格式或回報問題。"
 
@@ -188,7 +205,7 @@ def handle_message(event):
 
 # --- 4. 核心功能實現 ---
 
-# [C] 日期解析 (已修正：人名/地點順序反轉 and 雜訊過濾)
+# [C] 日期解析 (與前一版本相同)
 def parse_record_command(text: str):
     """
     解析費用紀錄指令。格式: [月/日(星期)] [人名1] [地點名] [人名2]... [金額(可選)]
@@ -224,14 +241,14 @@ def parse_record_command(text: str):
         manual_cost = int(cost_match.group(1))
         remaining_text = remaining_text[:cost_match.start()].strip() 
     
-    # 🌟 雜訊過濾器：過濾掉非指令詞彙
+    # 🌟 雜訊過濾器
     FILTER_WORDS = ['好', '桌5布4燈1', '架1']
     parts = [p for p in remaining_text.split() if p not in FILTER_WORDS] 
     
     if len(parts) < 2:
         return None, "請至少指定一位人名和一個地點"
 
-    # --- 關鍵修正：現在第一個是人名 (人名1)，第二個是地點名 ---
+    # --- 順序修正：第一個是人名 (人名1)，第二個是地點名 ---
     member_names = [parts[0]] 
     location_name = parts[1]  
     
@@ -250,7 +267,7 @@ def parse_record_command(text: str):
         'manual_cost': manual_cost
     }, None
 
-# 輔助函數: 獲取地點成本
+# 輔助函數: 獲取地點成本 (與前一版本相同)
 def get_location_cost(conn, location_name, full_date):
     """根據日期和地點獲取成本"""
     is_weekend = (full_date.weekday() >= 5) 
@@ -266,7 +283,7 @@ def get_location_cost(conn, location_name, full_date):
         app.logger.error(f"獲取地點成本失敗: {e}")
         return None
 
-# [D] 費用紀錄功能 (Project-Based 邏輯)
+# [D] 費用紀錄功能 (Project-Based 邏輯 - 與前一版本相同)
 def handle_record_expense(text: str) -> str:
     """處理費用紀錄指令，實作 Project-Based 兩階段分攤邏輯。"""
     parsed_data, error = parse_record_command(text)
@@ -274,7 +291,7 @@ def handle_record_expense(text: str) -> str:
         return f"❌ 指令解析失敗: {error}"
         
     full_date = parsed_data['full_date']
-    new_members = parsed_data['member_names'] # 這次指令新增的人員
+    new_members = parsed_data['member_names'] 
     location_name = parsed_data['location_name']
     manual_cost = parsed_data['manual_cost']
 
@@ -283,6 +300,8 @@ def handle_record_expense(text: str) -> str:
 
     try:
         with conn.cursor() as cur:
+            # ... (專案存在/不存在邏輯，與前一版本完全相同)
+            
             # 1. 檢查該地點/日期是否已有專案 (Project)
             cur.execute("""
                 SELECT p.project_id, p.member_cost_pool
@@ -296,7 +315,6 @@ def handle_record_expense(text: str) -> str:
             if project_data:
                 project_id, member_cost_pool = project_data
                 
-                # 檢查新成員是否已在專案中，並將未加入的成員加入
                 cur.execute("""
                     SELECT member_name FROM project_members WHERE project_id = %s;
                 """, (project_id,))
@@ -307,7 +325,6 @@ def handle_record_expense(text: str) -> str:
                 if not members_to_add and len(new_members) > 0:
                     return f"💡 {location_name} 在 {full_date.strftime('%m/%d')} 的紀錄已存在，且所有指定成員都已加入分攤名單。"
 
-                # 排除 COMPANY_NAME 和已在名單中的成員
                 all_business_members = sorted(list(set(current_members) | set(new_members)))
                 
                 N = len(all_business_members)
@@ -318,30 +335,25 @@ def handle_record_expense(text: str) -> str:
                     C_member_individual = member_cost_pool // N
                     remainder_members = member_cost_pool % N
 
-                # 重新計算 BOSS 的最終攤提金額
                 C_company_final = member_cost_pool + remainder_members
                 
-                # 2. 更新 project_members (加入新成員)
                 for member in members_to_add:
                     cur.execute("""
                         INSERT INTO project_members (project_id, member_name) VALUES (%s, %s) 
                         ON CONFLICT (project_id, member_name) DO NOTHING;
                     """, (project_id, member))
 
-                # 3. 清除並更新 records 表 (重新計算攤提)
                 cur.execute("DELETE FROM records WHERE project_id = %s;", (project_id,))
                 
-                # 寫入 BOSS 紀錄
                 cur.execute("""
-                    INSERT INTO records (record_date, member_name, project_id, cost_paid, original_msg)
-                    VALUES (%s, %s, %s, %s, %s);
+                    INSERT INTO records (record_date, member_name, project_id, monthly_cost_id, cost_paid, original_msg)
+                    VALUES (%s, %s, %s, NULL, %s, %s);
                 """, (full_date, COMPANY_NAME, project_id, C_company_final, text))
 
-                # 寫入每個業務員的紀錄
                 for member in all_business_members:
                     cur.execute("""
-                        INSERT INTO records (record_date, member_name, project_id, cost_paid, original_msg)
-                        VALUES (%s, %s, %s, %s, %s);
+                        INSERT INTO records (record_date, member_name, project_id, monthly_cost_id, cost_paid, original_msg)
+                        VALUES (%s, %s, %s, NULL, %s, %s);
                     """, (full_date, member, project_id, C_member_individual, text))
                 
                 conn.commit()
@@ -354,18 +366,16 @@ def handle_record_expense(text: str) -> str:
 
             # --- 情況 B: 專案不存在 (初次紀錄/Project Lead) ---
             else:
-                # 1. 取得總成本 C
                 C = manual_cost if manual_cost is not None else get_location_cost(conn, location_name, full_date)
                 if C is None:
                     return f"❌ 地點 '{location_name}' 尚未設定成本，請先使用 '新增 地點' 指令。"
 
-                # 2. 核心計算邏輯 (兩階段分攤)
                 N = len(new_members)
                 C_unit_total = C // 2
                 remainder_total = C % 2 
                 
-                C_company_stage1 = C_unit_total + remainder_total # BOSS 50% + 總餘數
-                member_cost_pool = C_unit_total # 業務員總成本池 (50%)
+                C_company_stage1 = C_unit_total + remainder_total
+                member_cost_pool = C_unit_total
                 
                 C_member_individual = 0
                 remainder_members = 0
@@ -374,31 +384,28 @@ def handle_record_expense(text: str) -> str:
                     C_member_individual = member_cost_pool // N
                     remainder_members = member_cost_pool % N
                     
-                C_company_final = C_company_stage1 + remainder_members # BOSS 最終攤提 (含業務員分攤餘數)
+                C_company_final = C_company_stage1 + remainder_members
 
-                # 3. 寫入 projects 表 (取得 project_id)
                 cur.execute("""
                     INSERT INTO projects (record_date, location_name, total_fixed_cost, member_cost_pool, original_msg)
                     VALUES (%s, %s, %s, %s, %s) RETURNING project_id;
                 """, (full_date, location_name, C, member_cost_pool, text))
                 project_id = cur.fetchone()[0]
 
-                # 4. 寫入 project_members 表
                 for member in new_members:
                     cur.execute("""
                         INSERT INTO project_members (project_id, member_name) VALUES (%s, %s);
                     """, (project_id, member))
 
-                # 5. 寫入 records 表 (BOSS 和所有業務員)
                 cur.execute("""
-                    INSERT INTO records (record_date, member_name, project_id, cost_paid, original_msg)
-                    VALUES (%s, %s, %s, %s, %s);
+                    INSERT INTO records (record_date, member_name, project_id, monthly_cost_id, cost_paid, original_msg)
+                    VALUES (%s, %s, %s, NULL, %s, %s);
                 """, (full_date, COMPANY_NAME, project_id, C_company_final, text))
 
                 for member in new_members:
                     cur.execute("""
-                        INSERT INTO records (record_date, member_name, project_id, cost_paid, original_msg)
-                        VALUES (%s, %s, %s, %s, %s);
+                        INSERT INTO records (record_date, member_name, project_id, monthly_cost_id, cost_paid, original_msg)
+                        VALUES (%s, %s, %s, NULL, %s, %s);
                     """, (full_date, member, project_id, C_member_individual, text))
                 
                 conn.commit()
@@ -422,9 +429,155 @@ def handle_record_expense(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [A] 新增/更新功能
+# [G] 🌟 新增月度固定成本功能
+def handle_monthly_cost(text: str) -> str:
+    """
+    處理月成本攤提指令。格式: 月成本 [月份 (如 11月)] [金額] [人名1] [人名2]... [備註]
+    """
+    parts = text.split()
+    if len(parts) < 4 or parts[0] != '月成本':
+        return "❌ 月成本指令格式錯誤。請使用: 月成本 [月份 (如 11月)] [金額] [人名1] [人名2]... [備註/項目名]"
+        
+    month_str = parts[1].replace('月', '').strip()
+    
+    try:
+        target_month = int(month_str)
+        cost_amount = int(parts[2])
+    except ValueError:
+        return "❌ 月份或金額必須是有效的數字。"
+
+    member_names_raw = parts[3:]
+    
+    # 提取備註 (預設為 '月度固定成本')
+    memo = "月度固定成本"
+    if member_names_raw:
+        # 尋找第一個非人名（備註）
+        potential_memo_start_index = 0
+        
+        # 簡易判斷：如果最後一個詞不是人名，則視為備註
+        if len(member_names_raw) > 1:
+            memo_parts = member_names_raw[-1].split(':')
+            if len(memo_parts) > 1 and memo_parts[0] == '項目':
+                 memo = memo_parts[1]
+                 member_names = member_names_raw[:-1]
+            else:
+                member_names = member_names_raw
+                memo = ' '.join(member_names_raw) # 假設所有剩餘的都是人名，備註使用預設
+        else:
+            member_names = member_names_raw
+    else:
+        return "❌ 請至少指定一位分攤人名。"
+        
+    
+    # 假設指令格式為: 月成本 11月 10000 人名1 人名2 項目:租金
+    # 讓我們重新調整人名和備註的提取邏輯
+    
+    # 提取所有在人名前面的詞彙
+    name_and_memo = parts[3:]
+    member_names = []
+    memo = "月度固定成本"
+    
+    # 找出備註（假設備註是最後一個詞，且可能含有中文）
+    if name_and_memo:
+        # 嘗試在最後一個詞尋找備註分隔符號
+        last_part = name_and_memo[-1]
+        if ":" in last_part or "：" in last_part:
+            memo = last_part.replace('項目:', '').replace('項目：', '')
+            member_names = name_and_memo[:-1]
+        else:
+             # 如果沒有分隔符號，則嘗試從第一個非數字/非單一人名的詞開始
+            member_names = name_and_memo
+            memo = "月度固定成本" # 避免將人名誤判為備註
+            
+    # 如果人名清單為空
+    if not member_names:
+        return "❌ 請至少指定一位分攤人名。"
+    
+    # 移除 COMPANY_NAME (會自動加入)
+    member_names = [n for n in member_names if n != COMPANY_NAME]
+    
+    # 計算日期 (取當年的目標月份的第一天)
+    current_year = date.today().year
+    
+    # 如果目標月份小於當前月份，則假定為明年 (例如 12月問 1月)
+    if target_month < date.today().month and date.today().month == 12:
+         current_year += 1
+    
+    try:
+        cost_date = date(current_year, target_month, 1)
+    except ValueError:
+        return "❌ 無效的月份或年份計算錯誤。"
+
+    conn = get_db_connection()
+    if not conn: return "❌ 資料庫連接失敗。"
+
+    try:
+        with conn.cursor() as cur:
+            # 檢查所有指定人名是否存在
+            for name in member_names:
+                cur.execute("SELECT name FROM members WHERE name = %s", (name,))
+                if cur.fetchone() is None:
+                    return f"❌ 成員 {name} 不存在。請先使用 '新增人名'。"
+
+            # 總分攤人數 (所有業務員 + 公司)
+            total_sharers = len(member_names) + 1 
+            
+            # 計算平均分攤金額和餘數
+            cost_per_sharer = cost_amount // total_sharers
+            remainder = cost_amount % total_sharers
+            
+            # 公司的最終分攤金額 (業務員分攤金額 + 餘數)
+            company_cost = cost_per_sharer + remainder
+            
+            # 檢查該月份是否已記錄，如果已記錄，則刪除舊的 (更新)
+            cur.execute("SELECT id FROM monthly_costs WHERE cost_date = %s;", (cost_date,))
+            old_cost_id = cur.fetchone()
+            
+            if old_cost_id:
+                # 級聯刪除舊的 records
+                cur.execute("DELETE FROM monthly_costs WHERE id = %s;", (old_cost_id[0],))
+            
+            # 1. 寫入 monthly_costs 表 (取得 ID)
+            member_list_str = ','.join(member_names)
+            cur.execute("""
+                INSERT INTO monthly_costs (cost_date, cost_amount, member_list, memo)
+                VALUES (%s, %s, %s, %s) RETURNING id;
+            """, (cost_date, cost_amount, member_list_str, memo))
+            monthly_cost_id = cur.fetchone()[0]
+
+            # 2. 寫入 records 表 (公司)
+            cur.execute("""
+                INSERT INTO records (record_date, member_name, project_id, monthly_cost_id, cost_paid, original_msg)
+                VALUES (%s, %s, NULL, %s, %s, %s);
+            """, (cost_date, COMPANY_NAME, monthly_cost_id, company_cost, text))
+
+            # 3. 寫入 records 表 (業務員)
+            for member in member_names:
+                cur.execute("""
+                    INSERT INTO records (record_date, member_name, project_id, monthly_cost_id, cost_paid, original_msg)
+                    VALUES (%s, %s, NULL, %s, %s, %s);
+                """, (cost_date, member, monthly_cost_id, cost_per_sharer, text))
+            
+            conn.commit()
+            
+            action = "更新" if old_cost_id else "新增"
+            return f"""✅ 成功{action} {target_month} 月份月成本分攤：『{memo}』
+--------------------------------
+總成本: {cost_amount:,} 元
+總分攤人數: {total_sharers} (包含 {COMPANY_NAME})
+每位業務員攤提: {cost_per_sharer} 元
+{COMPANY_NAME} 攤提: {company_cost:,} 元 (含餘數 {remainder})"""
+        
+    except Exception as e:
+        conn.rollback()
+        app.logger.error(f"月成本指令資料庫錯誤: {e}")
+        return f"❌ 處理月成本發生錯誤: {e}"
+    finally:
+        if conn: conn.close()
+        
+# [A] 新增/更新功能 (與前一版本相同)
 def handle_management_add(text: str) -> str:
-    """處理 新增 地點/人名 指令"""
+    # ... (程式碼與前一版本完全相同)
     parts = text.split()
     conn = get_db_connection()
     if not conn: return "❌ 資料庫連接失敗。"
@@ -478,12 +631,12 @@ def handle_management_add(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [B] 清單查詢功能
+# [B] 清單查詢功能 (已新增月成本清單邏輯)
 def handle_management_list(text: str) -> str:
-    """處理 清單 人名/地點 指令，查詢並列出設定"""
+    """處理 清單 人名/地點/月成本 指令，查詢並列出設定"""
     parts = text.split()
     if len(parts) != 2 or parts[0] != '清單':
-        return "❌ 清單指令格式錯誤。請使用: 清單 人名 或 清單 地點。"
+        return "❌ 清單指令格式錯誤。請使用: 清單 人名, 清單 地點, 或 清單 月成本。"
         
     list_type = parts[1].lower()
     conn = get_db_connection()
@@ -514,8 +667,20 @@ def handle_management_list(text: str) -> str:
                         response += f"• {name}: 平日 {weekday_cost} / 假日 {weekend_cost}\n"
                 return response.strip()
 
+            elif list_type == '月成本': # 🌟 新增月成本清單
+                cur.execute("SELECT cost_date, cost_amount, member_list, memo FROM monthly_costs ORDER BY cost_date DESC;")
+                monthly_costs = cur.fetchall()
+                
+                if not monthly_costs: return "📋 目前沒有任何已設定的月度成本紀錄。"
+
+                response = "📋 **現有月度成本紀錄:**\n"
+                for cost_date, cost_amount, member_list, memo in monthly_costs:
+                    members = member_list.replace(',', '、')
+                    response += f"• {cost_date.strftime('%Y/%m')} [{memo}]: {cost_amount:,} 元 (分攤人: {members})\n"
+                return response.strip()
+                
             else:
-                return "❌ 無法識別的清單類別。請輸入 '清單 人名' 或 '清單 地點'。"
+                return "❌ 無法識別的清單類別。請輸入 '清單 人名', '清單 地點', 或 '清單 月成本'。"
 
     except Exception as e:
         app.logger.error(f"清單指令資料庫錯誤: {e}")
@@ -523,7 +688,7 @@ def handle_management_list(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [E] 費用統計功能
+# [E] 費用統計功能 (已更新以包含月成本)
 def handle_management_stat(text: str) -> str:
     """處理 統計 [人名/公司] [月份] 指令"""
     parts = text.split()
@@ -550,11 +715,10 @@ def handle_management_stat(text: str) -> str:
             if cur.fetchone() is None:
                 return f"❌ 無法統計。成員 {target_name} 不存在於名單中。"
 
-            # 查詢特定成員在特定月份的總費用
+            # 查詢特定成員在特定月份的總費用 (包含 projects 和 monthly_costs 兩種紀錄)
             cur.execute("""
                 SELECT SUM(cost_paid)
                 FROM records r
-                JOIN projects p ON r.project_id = p.project_id
                 WHERE r.member_name = %s 
                   AND date_part('month', r.record_date) = %s;
             """, (target_name, target_month))
@@ -565,7 +729,7 @@ def handle_management_stat(text: str) -> str:
                 return f"✅ {target_name} 在 {target_month} 月份沒有任何費用紀錄。"
             
             # 使用千位數分隔符號讓數字更易讀
-            return f"📈 **{target_name} {target_month} 月份總費用統計**：\n總通路費用為：**{total_cost:,}** 元。"
+            return f"📈 **{target_name} {target_month} 月份總費用統計**：\n總攤提費用為：**{total_cost:,}** 元 (含月度成本攤提)。"
 
     except Exception as e:
         app.logger.error(f"統計指令資料庫錯誤: {e}")
@@ -573,9 +737,9 @@ def handle_management_stat(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [F] 刪除功能
+# [F] 刪除功能 (已更新以支援刪除月成本)
 def handle_management_delete(text: str) -> str:
-    """處理 刪除 地點/人名/紀錄 指令"""
+    """處理 刪除 地點/人名/紀錄/月成本 指令"""
     parts = text.split()
     conn = get_db_connection()
     if not conn: return "❌ 資料庫連接失敗。"
@@ -587,7 +751,6 @@ def handle_management_delete(text: str) -> str:
                 date_part_str = parts[2]
                 location_name = parts[3]
                 
-                # 由於解析順序已改變，這裡要模擬新的指令格式來獲取日期
                 temp_text = f"{date_part_str} 測試人名 {location_name}"
                 parsed_date_data, _ = parse_record_command(temp_text)
                 
@@ -596,7 +759,6 @@ def handle_management_delete(text: str) -> str:
                         
                 record_date = parsed_date_data['full_date']
 
-                # A. 查詢目標 Project 的 project_id
                 cur.execute("""
                     SELECT project_id FROM projects
                     WHERE record_date = %s AND location_name = %s
@@ -609,20 +771,42 @@ def handle_management_delete(text: str) -> str:
                     return f"💡 找不到 {location_name} 在 {date_part_str} 的專案紀錄。"
 
                 project_id = project_id_result[0]
-
-                # B. 刪除 Project (會級聯刪除 records 和 project_members)
                 cur.execute("DELETE FROM projects WHERE project_id = %s;", (project_id,))
                 
                 conn.commit()
                 return f"✅ 已成功刪除 {location_name} 在 {date_part_str} 的整個專案紀錄 (包含所有成員攤提)。"
 
-            # --- 2. 刪除成員 (刪除 人名 彼) ---
+            # --- 2. 刪除月成本 (刪除 月成本 [月份]) --- 🌟 新增
+            elif len(parts) == 3 and parts[1] == '月成本':
+                month_str = parts[2].replace('月', '').strip()
+                try:
+                    target_month = int(month_str)
+                except ValueError:
+                    return "❌ 月份格式錯誤，請輸入有效的數字月份 (如 11月)。"
+
+                current_year = date.today().year
+                if target_month < date.today().month and date.today().month == 12:
+                    current_year += 1
+                try:
+                    cost_date = date(current_year, target_month, 1)
+                except ValueError:
+                    return "❌ 無效的月份或年份計算錯誤。"
+
+                cur.execute("DELETE FROM monthly_costs WHERE cost_date = %s RETURNING id;", (cost_date,))
+                
+                if cur.rowcount > 0:
+                    conn.commit()
+                    return f"✅ 已成功刪除 {target_month} 月份的月度固定成本紀錄。"
+                else:
+                    return f"💡 找不到 {target_month} 月份的月度固定成本紀錄。"
+
+
+            # --- 3. 刪除成員 (刪除 人名 彼) ---
             elif len(parts) == 3 and parts[1] == '人名':
                 member_name = parts[2]
                 if member_name == COMPANY_NAME:
                     return f"❌ 無法刪除系統專用成員 {COMPANY_NAME}。"
                     
-                # 由於 ON DELETE CASCADE，刪除成員會自動刪除相關紀錄
                 cur.execute("DELETE FROM members WHERE name = %s;", (member_name,))
                 if cur.rowcount > 0:
                     conn.commit()
@@ -630,10 +814,9 @@ def handle_management_delete(text: str) -> str:
                 else:
                     return f"💡 名單中找不到 {member_name}。"
 
-            # --- 3. 刪除地點 (刪除 地點 市集) ---
+            # --- 4. 刪除地點 (刪除 地點 市集) ---
             elif len(parts) == 3 and parts[1] == '地點':
                 loc_name = parts[2]
-                # 由於 locations 被 projects 引用，若刪除會導致 RestrictViolation
                 cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,))
                 if cur.rowcount > 0:
                     conn.commit()
@@ -642,7 +825,7 @@ def handle_management_delete(text: str) -> str:
                     return f"💡 地點 {loc_name} 不存在。"
                     
             else:
-                return "❌ 刪除指令格式錯誤。\n刪除 人名 [人名]\n刪除 地點 [地點名]\n刪除 紀錄 [月/日(星期)] [地點名]"
+                return "❌ 刪除指令格式錯誤。\n刪除 人名 [人名]\n刪除 地點 [地點名]\n刪除 紀錄 [月/日(星期)] [地點名]\n刪除 月成本 [月份(如 11月)]"
 
     except psycopg2.errors.RestrictViolation:
         conn.rollback()
