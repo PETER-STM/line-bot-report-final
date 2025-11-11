@@ -45,7 +45,7 @@ def init_db(force_recreate=False):
     try:
         with conn.cursor() as cur:
             
-            # --- ❗ 只有在明確要求時才執行強制重建 (現在已經預設關閉) ---
+            # --- ❗ 永久移除強制重建，只在明確要求時執行 ---
             if force_recreate:
                 app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格以修正 Schema。資料將遺失。❗❗❗")
                 cur.execute("DROP TABLE IF EXISTS records;")
@@ -121,7 +121,7 @@ def init_db(force_recreate=False):
     finally:
         if conn: conn.close()
 
-# ⚠️ 最終修正：不再傳入 force_recreate=True。資料將被保留。
+# ⚠️ 最終修正：資料庫初始化，不執行強制重建。
 init_db(force_recreate=False) 
 
 # --- 3. Webhook 處理 (包含指令提取與中/英文括號支援) ---
@@ -147,13 +147,13 @@ def handle_message(event):
     response = ""
 
     try:
-        # 嘗試從任何位置提取 "日期(星期) [地點] [人名...]" 格式的紀錄指令
+        # 嘗試從任何位置提取 "日期(星期) [地點] [人名...]" 格式的核心指令
         # 【支援中/英文括號】: [\(\（]\w[\)\）]
         record_match = re.search(r'(\d{1,2}/\d{1,2}[\(\（]\w[\)\）])\s+([^\s]+.*)', original_text)
 
         if original_text.startswith('新增') or original_text.startswith('刪除') or original_text.startswith('清單') or original_text.startswith('統計'):
             # 對於管理指令，仍然要求精準匹配
-            text = original_text.split('\n')[0].strip() # 僅取第一行，避免多行訊息干擾
+            text = original_text.split('\n')[0].strip() 
             
             if text.startswith('新增'):
                 response = handle_management_add(text)
@@ -171,7 +171,7 @@ def handle_message(event):
             # 將提取出來的指令傳給處理函數
             response = handle_record_expense(record_text)
         else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 地點 人名' (v5.1-提取模式)。"
+            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 人名 地點' (v6-順序修正)。"
             
     except Exception as e:
         app.logger.error(f"處理指令失敗: {e}")
@@ -186,30 +186,28 @@ def handle_message(event):
         TextSendMessage(text=response)
     )
 
-# --- 4. 核心功能實現 (與前一版本相同) ---
+# --- 4. 核心功能實現 ---
 
-# [C] 日期解析 (已修改以處理中/英文括號)
+# [C] 日期解析 (已修正：人名/地點順序反轉 and 雜訊過濾)
 def parse_record_command(text: str):
     """
-    解析費用紀錄指令。格式: [月/日(星期)] [地點名] [人名1] [人名2]... [金額(可選)]
+    解析費用紀錄指令。格式: [月/日(星期)] [人名1] [地點名] [人名2]... [金額(可選)]
     """
-    # 【支援中/英文括號】: [\(\（](\w)[\)\）]
+    # 支援中/英文括號: [\(\（](\w)[\)\）]
     date_match = re.match(r'^(\d{1,2}/\d{1,2})[\(\（](\w)[\)\）]', text)
     if not date_match:
         return None, "日期格式錯誤 (月/日(星期))"
 
     record_date_str = date_match.group(1) 
     
-    # 年份自動判斷
+    # 年份自動判斷 (邏輯略)
     today = date.today()
     current_year = today.year
     input_month = int(record_date_str.split('/')[0])
     
     record_year = current_year
-    # 假設用戶輸入的月份還沒到 (例如 12月問 1月)，則認為是明年
     if today.month == 12 and input_month == 1 or (today.month > 1 and input_month < today.month):
         record_year = current_year + 1
-    # 假設用戶輸入的月份已經過去 (例如 1月問 12月)，則認為是去年
     elif today.month == 1 and input_month == 12 or (today.month > 1 and input_month > today.month):
         record_year = current_year - 1
         
@@ -226,13 +224,21 @@ def parse_record_command(text: str):
         manual_cost = int(cost_match.group(1))
         remaining_text = remaining_text[:cost_match.start()].strip() 
     
-    parts = remaining_text.split()
-    if len(parts) < 2:
-        return None, "請至少指定一個地點和一位人名"
-
-    location_name = parts[0]
-    member_names = parts[1:]
+    # 🌟 雜訊過濾器：過濾掉非指令詞彙
+    FILTER_WORDS = ['好', '桌5布4燈1', '架1']
+    parts = [p for p in remaining_text.split() if p not in FILTER_WORDS] 
     
+    if len(parts) < 2:
+        return None, "請至少指定一位人名和一個地點"
+
+    # --- 關鍵修正：現在第一個是人名 (人名1)，第二個是地點名 ---
+    member_names = [parts[0]] 
+    location_name = parts[1]  
+    
+    # 後面所有詞都當作是人名
+    if len(parts) > 2:
+        member_names.extend(parts[2:])
+
     if COMPANY_NAME in member_names:
         return None, f"請勿在紀錄中包含 {COMPANY_NAME}，它會自動加入計算。"
 
@@ -581,7 +587,8 @@ def handle_management_delete(text: str) -> str:
                 date_part_str = parts[2]
                 location_name = parts[3]
                 
-                temp_text = f"{date_part_str} {location_name} 測試人名 1"
+                # 由於解析順序已改變，這裡要模擬新的指令格式來獲取日期
+                temp_text = f"{date_part_str} 測試人名 {location_name}"
                 parsed_date_data, _ = parse_record_command(temp_text)
                 
                 if not parsed_date_data:
