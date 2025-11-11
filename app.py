@@ -12,7 +12,7 @@ from psycopg2 import sql
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 DATABASE_URL = os.getenv('DATABASE_URL')
-COMPANY_NAME = os.getenv('COMPANY_NAME', 'BOSS') # 公司的名稱/代號
+COMPANY_NAME = os.getenv('COMPANY_NAME', '公司') # 公司的名稱/代號
 
 # 初始化 Flask App 和 LINE BOT API
 app = Flask(__name__)
@@ -398,7 +398,7 @@ def handle_record_expense(text: str) -> str:
                     return f"""✅ 啟動 {location_name} 專案 ({full_date.strftime('%m/%d')})。
 --------------------------------
 活動成本: {C_activity:,} + 固定成本({linked_item_name}): {C_fixed:,} = 總成本 {C_total:,}。
-由 {len(new_members)} 位業務員和 BOSS 平分 (共 {total_sharers} 份)。
+由 {len(new_members)} 位業務員和 公司 平分 (共 {total_sharers} 份)。
 每人應攤提費用: {C_share_per_person:,}
 {COMPANY_NAME} 攤提: {C_company_final:,} (含餘數 {remainder})
 💡 注意：此費用已包含月固定成本，該項目在月結時將會自動扣除。"""
@@ -489,7 +489,7 @@ def handle_record_expense(text: str) -> str:
                 # 刪除並重寫 Records (確保攤提金額更新)
                 cur.execute("DELETE FROM records WHERE project_id = %s;", (project_id,))
                 
-                # 重寫 BOSS 紀錄
+                # 重寫 公司 紀錄
                 cur.execute("""
                     INSERT INTO records (record_date, member_name, project_id, monthly_settlement_id, cost_paid, original_msg)
                     VALUES (%s, %s, %s, NULL, %s, %s);
@@ -584,7 +584,7 @@ def handle_management_add(text: str) -> str:
                 """, (loc_name, cost_val, cost_val, linked_item))
                 conn.commit()
                 return f"""✅ 地點「{loc_name}」已設定成功，單次活動成本 {cost_val}，
-並連動月成本項目「{linked_item}」。當日發生時，總成本平分給所有參與者與 BOSS。
+並連動月成本項目「{linked_item}」。當日發生時，總成本平分給所有參與者與 公司。
 💡 欲強制標準分攤 (只攤活動成本)，請在指令末尾加上 **標準**。"""
 
             else:
