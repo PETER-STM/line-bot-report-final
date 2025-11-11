@@ -12,7 +12,7 @@ from psycopg2 import sql
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 DATABASE_URL = os.getenv('DATABASE_URL')
-COMPANY_NAME = os.getenv('COMPANY_NAME', '公司') # 公司的名稱/代號
+COMPANY_NAME = os.getenv('COMPANY_NAME', 'BOSS') # 公司的名稱/代號
 
 # 初始化 Flask App 和 LINE BOT API
 app = Flask(__name__)
@@ -150,8 +150,8 @@ def init_db(force_recreate=False):
     finally:
         if conn: conn.close()
 
-# ⚠️ 注意: 首次部署/修復 Schema 必須設為 True！修復後必須改回 False
-init_db(force_recreate=True) 
+# ⚠️ 注意: 請手動確認此處設定為 False，以保留您現有的測試數據
+init_db(force_recreate=False) 
 
 # --- 3. Webhook 處理 ---
 @app.route("/callback", methods=['POST'])
@@ -181,7 +181,8 @@ def handle_message(event):
         # 處理管理指令
         if original_text.startswith('新增') or original_text.startswith('刪除') or \
            original_text.startswith('清單') or original_text.startswith('統計') or \
-           original_text.startswith('結算') or original_text.startswith('報表'): 
+           original_text.startswith('結算') or original_text.startswith('報表') or \
+           original_text.startswith('出席'): # 🌟 新增出席指令判斷
             
             text = original_text.split('\n')[0].strip() 
             
@@ -199,6 +200,8 @@ def handle_message(event):
                 response = handle_settle_monthly_cost(text)
             elif text.startswith('報表'): 
                 response = handle_report(text)
+            elif text.startswith('出席'): # 🌟 新增出席指令分派
+                response = handle_attendance_report(text)
             else:
                 response = "無法識別的管理指令。"
 
@@ -398,7 +401,7 @@ def handle_record_expense(text: str) -> str:
                     return f"""✅ 啟動 {location_name} 專案 ({full_date.strftime('%m/%d')})。
 --------------------------------
 活動成本: {C_activity:,} + 固定成本({linked_item_name}): {C_fixed:,} = 總成本 {C_total:,}。
-由 {len(new_members)} 位業務員和 公司 平分 (共 {total_sharers} 份)。
+由 {len(new_members)} 位業務員和 BOSS 平分 (共 {total_sharers} 份)。
 每人應攤提費用: {C_share_per_person:,}
 {COMPANY_NAME} 攤提: {C_company_final:,} (含餘數 {remainder})
 💡 注意：此費用已包含月固定成本，該項目在月結時將會自動扣除。"""
@@ -489,7 +492,7 @@ def handle_record_expense(text: str) -> str:
                 # 刪除並重寫 Records (確保攤提金額更新)
                 cur.execute("DELETE FROM records WHERE project_id = %s;", (project_id,))
                 
-                # 重寫 公司 紀錄
+                # 重寫 BOSS 紀錄
                 cur.execute("""
                     INSERT INTO records (record_date, member_name, project_id, monthly_settlement_id, cost_paid, original_msg)
                     VALUES (%s, %s, %s, NULL, %s, %s);
@@ -584,7 +587,7 @@ def handle_management_add(text: str) -> str:
                 """, (loc_name, cost_val, cost_val, linked_item))
                 conn.commit()
                 return f"""✅ 地點「{loc_name}」已設定成功，單次活動成本 {cost_val}，
-並連動月成本項目「{linked_item}」。當日發生時，總成本平分給所有參與者與 公司。
+並連動月成本項目「{linked_item}」。當日發生時，總成本平分給所有參與者與 BOSS。
 💡 欲強制標準分攤 (只攤活動成本)，請在指令末尾加上 **標準**。"""
 
             else:
@@ -1109,6 +1112,75 @@ def handle_management_delete(text: str) -> str:
         conn.rollback()
         app.logger.error(f"刪除指令資料庫錯誤: {e}")
         return f"❌ 資料庫操作失敗: {e}"
+    finally:
+        if conn: conn.close()
+
+# [K] 活動出席統計 (V6.5 新增)
+def handle_attendance_report(text: str) -> str:
+    """統計該月所有成員的出席活動天數和缺席天數。"""
+    parts = text.split()
+    if len(parts) != 2 or parts[0] != '出席':
+        return "❌ 出席統計指令格式錯誤。請使用: 出席 [月份 (例如 11月)]。"
+
+    month_str = parts[1].replace('月', '').strip()
+    
+    try:
+        target_month = int(month_str)
+        if not (1 <= target_month <= 12): raise ValueError
+    except ValueError:
+        return "❌ 月份格式錯誤。請輸入有效的數字月份 (1 到 12)。"
+        
+    conn = get_db_connection()
+    if not conn: return "❌ 資料庫連接失敗。"
+
+    try:
+        with conn.cursor() as cur:
+            # 1. 查詢該月總活動天數 (排除月結算紀錄)
+            cur.execute("""
+                SELECT COUNT(DISTINCT record_date)
+                FROM projects
+                WHERE date_part('month', record_date) = %s;
+            """, (target_month,))
+            
+            total_activity_days = cur.fetchone()[0]
+
+            if total_activity_days == 0:
+                return f"✅ {target_month} 月份沒有任何活動紀錄（專案）。"
+
+            # 2. 查詢所有業務員 (排除 COMPANY_NAME)
+            cur.execute("SELECT name FROM members WHERE name != %s ORDER BY name;", (COMPANY_NAME,))
+            all_members = [row[0] for row in cur.fetchall()]
+            
+            # 3. 查詢該月每位成員的出席天數
+            cur.execute("""
+                SELECT 
+                    pm.member_name, 
+                    COUNT(DISTINCT p.record_date) AS days_attended
+                FROM project_members pm
+                JOIN projects p ON pm.project_id = p.project_id
+                WHERE date_part('month', p.record_date) = %s
+                GROUP BY pm.member_name
+                ORDER BY pm.member_name;
+            """, (target_month,))
+            
+            attendance_data = {row[0]: row[1] for row in cur.fetchall()}
+
+            # 4. 彙整結果
+            response = f"📋 **{target_month} 月份活動出席統計 (共 {total_activity_days} 天)**\n"
+            
+            for member in all_members:
+                days_attended = attendance_data.get(member, 0)
+                days_absent = total_activity_days - days_attended
+                
+                response += f"• **{member}**: 去 {days_attended} 天 / 不去 {days_absent} 天\n"
+            
+            response += f"\n(註: 此統計不包含 {COMPANY_NAME}，也不計入月成本結算日。)"
+
+            return response.strip()
+
+    except Exception as e:
+        app.logger.error(f"出席統計資料庫錯誤: {e}")
+        return f"❌ 查詢出席統計發生錯誤: {e}"
     finally:
         if conn: conn.close()
 
