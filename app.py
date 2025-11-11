@@ -1,4 +1,3 @@
-# TEST LINE
 import os
 import re
 from datetime import datetime, date
@@ -10,7 +9,6 @@ import psycopg2
 from psycopg2 import sql
 
 # --- 1. 環境變數與設定 ---
-# 這些變數應在 Railway 的環境設定中配置
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -36,15 +34,27 @@ def get_db_connection():
         app.logger.error(f"資料庫連接失敗: {e}")
         return None
 
-def init_db():
-    """初始化資料庫表格 (地點、成員、紀錄)"""
+def init_db(force_recreate=False):
+    """
+    初始化資料庫表格 (地點、成員、紀錄)
+    :param force_recreate: 如果為 True，將會 DROP TABLE 並重建，以強制修正 Schema。
+    """
     conn = get_db_connection()
     if not conn:
         return
         
     try:
         with conn.cursor() as cur:
-            # 1. 地點設定表 (修正：欄位名稱由 name 統一改為 location_name)
+            
+            # --- ❗ 解決 Schema 衝突的方案：強制刪除並重建表格 ---
+            if force_recreate:
+                app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格以修正 Schema。資料將遺失。❗❗❗")
+                cur.execute("DROP TABLE IF EXISTS records;")
+                cur.execute("DROP TABLE IF EXISTS locations;")
+                cur.execute("DROP TABLE IF EXISTS members;")
+            # ---------------------------------------------------
+                
+            # 1. 地點設定表 (確保 location_name 存在)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS locations (
                     location_name VARCHAR(50) PRIMARY KEY,
@@ -59,14 +69,13 @@ def init_db():
                 );
             """)
             # 3. 費用紀錄表
-            # unique_group_id 用於同組紀錄 (所有業務員和公司) 統一刪除
             cur.execute("""
                 CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; 
                 CREATE TABLE IF NOT EXISTS records (
                     id SERIAL PRIMARY KEY,
                     record_date DATE NOT NULL,
                     member_name VARCHAR(50) REFERENCES members(name),
-                    location_name VARCHAR(50) REFERENCES locations(location_name), -- 修正：引用 locations(location_name)
+                    location_name VARCHAR(50) REFERENCES locations(location_name),
                     cost_paid INTEGER NOT NULL,
                     original_msg TEXT,
                     unique_group_id UUID DEFAULT uuid_generate_v4()
@@ -76,7 +85,7 @@ def init_db():
             # 確保 '公司' 作為分攤單位存在於 members 表
             cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (COMPANY_NAME,))
             
-            # 自動插入 Bot 嘗試寫入的地點 '市集'，解決外鍵錯誤 (上次新增的邏輯)
+            # 預先插入 '市集' 避免外鍵錯誤 (因為這是在初始化時執行的)
             cur.execute("""
                 INSERT INTO locations (location_name, weekday_cost, weekend_cost)
                 VALUES (%s, 0, 0)
@@ -90,10 +99,13 @@ def init_db():
     finally:
         if conn: conn.close()
 
-# 啟動時自動初始化資料庫
-init_db()
+# 啟動時自動初始化資料庫 (請注意 force_recreate 的值)
+# ❗❗❗ 在您第一次部署此修正版本時，請將參數設為 True 以修復 Schema ❗❗❗
+# ❗❗❗ init_db(force_recreate=True)
+# ❗❗❗ 修復後，請改回 init_db() 避免資料被清除 ❗❗❗
+init_db(force_recreate=True) 
 
-# --- 3. Webhook 處理 (請確保此路由與 LINE 後台設定一致) ---
+# --- 3. Webhook 處理 ---
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -131,7 +143,6 @@ def handle_message(event):
         elif re.match(r'^\d{1,2}/\d{1,2}\(\w\).*', text):
             response = handle_record_expense(text)
         else:
-            # 這裡加入標記 (v3-final)
             response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 彼 市集' (v3-final)。"
             
     except Exception as e:
@@ -154,7 +165,7 @@ def handle_management_add(text: str) -> str:
 
     try:
         with conn.cursor() as cur:
-            # 處理：新增人名 [人名]
+            # 處理：新增人名 [人名] (共 2 部分)
             if len(parts) == 2 and parts[0] == '新增人名':
                 member_name = parts[1]
                 cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (member_name,))
@@ -163,28 +174,31 @@ def handle_management_add(text: str) -> str:
                 else:
                     return f"💡 成員 {member_name} 已存在。"
 
-            # 處理：新增 地點 [地點名] [成本] (單一費率)
+            # 處理：新增 地點 [地點名] [成本] (單一費率，共 4 部分)
             elif len(parts) == 4 and parts[1] == '地點':
                 loc_name, cost_val = parts[2], int(parts[3])
                 cur.execute("""
-                    INSERT INTO locations (location_name, weekday_cost, weekend_cost) -- 修正：使用 location_name
+                    INSERT INTO locations (location_name, weekday_cost, weekend_cost)
                     VALUES (%s, %s, %s)
                     ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
                 """, (loc_name, cost_val, cost_val))
                 return f"✅ 地點「{loc_name}」已設定成功，平日/假日成本皆為 {cost_val}。"
 
-            # 處理：新增 地點 [地點名] 平日 [成本] 假日 [成本] (雙費率)
-            elif len(parts) == 6 and parts[1] == '地點' and parts[3].lower() == '平日' and parts[5].lower() == '假日':
-                loc_name, weekday_cost_val, weekend_cost_val = parts[2], int(parts[4]), int(parts[5])
+            # 處理：新增 地點 [地點名] [平日成本] [假日成本] (雙費率，共 5 部分)
+            elif len(parts) == 5 and parts[1] == '地點':
+                loc_name = parts[2]
+                weekday_cost_val = int(parts[3])
+                weekend_cost_val = int(parts[4])
+                
                 cur.execute("""
-                    INSERT INTO locations (location_name, weekday_cost, weekend_cost) -- 修正：使用 location_name
+                    INSERT INTO locations (location_name, weekday_cost, weekend_cost)
                     VALUES (%s, %s, %s)
                     ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
                 """, (loc_name, weekday_cost_val, weekend_cost_val))
                 return f"✅ 地點「{loc_name}」已設定成功，平日 {weekday_cost_val}，假日 {weekend_cost_val}。"
                 
             else:
-                return "❌ 新增指令格式錯誤。請檢查指令是否完整。"
+                return "❌ 新增指令格式錯誤。\n新增人名 [人名]\n新增 地點 [地點名] [成本](單一)\n新增 地點 [地點名] [平日成本] [假日成本](雙費率)"
 
         conn.commit()
     except ValueError:
@@ -221,7 +235,7 @@ def handle_management_list(text: str) -> str:
                 return f"📋 **現有成員 (業務員/公司):**\n{member_list_str}"
 
             elif list_type == '地點':
-                cur.execute("SELECT location_name, weekday_cost, weekend_cost FROM locations ORDER BY location_name;") # 修正：使用 location_name
+                cur.execute("SELECT location_name, weekday_cost, weekend_cost FROM locations ORDER BY location_name;")
                 locations = cur.fetchall()
                 
                 if not locations: return "📋 目前沒有任何已設定的地點。"
@@ -253,14 +267,13 @@ def parse_record_command(text: str):
         return None, "日期格式錯誤 (月/日(星期))"
 
     record_date_str = date_match.group(1) 
-    day_of_week = date_match.group(2)
+    # day_of_week = date_match.group(2) # 實際上用不到，以 date.weekday() 為準
     
     # --- 年份自動判斷優化 ---
     today = date.today()
     current_year = today.year
     input_month = int(record_date_str.split('/')[0])
     
-    # 判斷年份：如果輸入月份 > 當前月份，則假定為前一年的日期 (只針對年初跨年情況)
     if today.month == 1 and input_month == 12:
         record_year = current_year - 1
     elif today.month > 1 and input_month > today.month:
@@ -295,7 +308,7 @@ def parse_record_command(text: str):
 
     return {
         'full_date': full_date,
-        'day_of_week': day_of_week,
+        'day_of_week': date_match.group(2), # 雖然不用於計算，但保留以供參考
         'member_names': member_names,
         'location_name': location_name,
         'manual_cost': manual_cost
@@ -309,7 +322,6 @@ def handle_record_expense(text: str) -> str:
         return f"❌ 指令解析失敗: {error}"
         
     full_date = parsed_data['full_date']
-    day_of_week = parsed_data['day_of_week']
     member_names = parsed_data['member_names']
     location_name = parsed_data['location_name']
     manual_cost = parsed_data['manual_cost']
@@ -323,11 +335,9 @@ def handle_record_expense(text: str) -> str:
         if manual_cost is not None:
             C = manual_cost
         else:
-            # 判斷是平日還是假日，使用 date.weekday() 來代替解析星期
-            # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
             is_weekend = (full_date.weekday() >= 5) 
             with conn.cursor() as cur:
-                cur.execute("SELECT weekday_cost, weekend_cost FROM locations WHERE location_name = %s", (location_name,)) # 修正：使用 location_name
+                cur.execute("SELECT weekday_cost, weekend_cost FROM locations WHERE location_name = %s", (location_name,))
                 result = cur.fetchone()
             
             if not result:
@@ -337,14 +347,14 @@ def handle_record_expense(text: str) -> str:
             C = weekend_cost if is_weekend else weekday_cost
             
         # --- 2. 核心計算邏輯 (兩階段分攤) ---
-        N = len(member_names)
+        N = len(member_names) 
         
         # 階段 1: 總成本 C 由 公司 (1) 和 業務員總體 (1) 平分
         C_unit_total = C // 2
-        remainder_total = C % 2
+        remainder_total = C % 2 
         
         C_company_stage1 = C_unit_total + remainder_total
-        C_members_total = C_unit_total
+        C_members_total = C_unit_total 
         
         C_member_individual = 0
         remainder_members = 0
@@ -352,7 +362,7 @@ def handle_record_expense(text: str) -> str:
         if N > 0:
             # 階段 2: 業務員總體成本 C_members_total 由 N 個業務員分攤
             C_member_individual = C_members_total // N
-            remainder_members = C_members_total % N
+            remainder_members = C_members_total % N 
             
         # 最終公司金額 (需加上業務員分攤的餘數)
         C_company_final = C_company_stage1 + remainder_members
@@ -388,14 +398,21 @@ def handle_record_expense(text: str) -> str:
                 ))
             
         conn.commit()
-        # 這裡加入標記 (v3-final)
+        
         return f"""✅ 紀錄成功 (v3-final)！總成本 {C}。
 --------------------------------
-公司 (1 單位) 應攤提費用: {C_company_final}
-{N} 位業務員 (總體 1 單位) 每人應攤提費用: {C_member_individual}"""
+公司 ({COMPANY_NAME}) 應攤提費用: {C_company_final}
+{N} 位業務員 每人應攤提費用: {C_member_individual}"""
         
     except ValueError:
         return "❌ 金額格式錯誤。"
+    except psycopg2.errors.ForeignKeyViolation as fke:
+        conn.rollback()
+        # 檢查是人名還是地點導致的外鍵錯誤
+        if 'members' in str(fke):
+             return f"❌ 紀錄失敗：人名 {member_names} 尚未加入清單。請先使用 '新增人名'。"
+        else: # locations
+             return f"❌ 紀錄失敗：地點 {location_name} 尚未設定。請先使用 '新增 地點'。"
     except Exception as e:
         conn.rollback()
         app.logger.error(f"費用紀錄資料庫錯誤: {e}")
@@ -406,7 +423,7 @@ def handle_record_expense(text: str) -> str:
 
 # [E] 費用統計功能
 def handle_management_stat(text: str) -> str:
-    """處理 統計 [人名] [月份] 指令"""
+    """處理 統計 [人名/公司] [月份] 指令"""
     parts = text.split()
     if len(parts) != 3 or parts[0] != '統計':
         return "❌ 統計指令格式錯誤。請使用: 統計 [人名/公司] [月份 (例如 9月)]。"
@@ -426,7 +443,12 @@ def handle_management_stat(text: str) -> str:
 
     try:
         with conn.cursor() as cur:
-            # 查詢特定成員在特定月份的總費用 (使用 date_part 函式)
+            # 檢查人名是否存在
+            cur.execute("SELECT name FROM members WHERE name = %s", (target_name,))
+            if cur.fetchone() is None:
+                return f"❌ 無法統計。成員 {target_name} 不存在於名單中。"
+
+            # 查詢特定成員在特定月份的總費用
             cur.execute("""
                 SELECT SUM(cost_paid)
                 FROM records
@@ -462,18 +484,12 @@ def handle_management_delete(text: str) -> str:
                 date_part_str = parts[2]
                 member_name = parts[3]
                 
-                date_match = re.match(r'^(\d{1,2}/\d{1,2})\((\w)\)', date_part_str)
-                if not date_match:
-                    return "❌ 刪除紀錄指令的日期格式錯誤 (月/日(星期))。"
-                
-                # 重新解析整個指令，取得正確的日期 (因為刪除指令的格式與紀錄指令相似)
-                # 這裡使用一個臨時解析器來判斷日期，因為 record_command 函式包含複雜的邏輯
-                temp_text = f"{date_part_str} {member_name} 測試地點 1" # 構造一個紀錄指令格式
+                temp_text = f"{date_part_str} {member_name} 測試地點 1"
                 parsed_date_data, _ = parse_record_command(temp_text)
                 
                 if not parsed_date_data:
-                    return "❌ 刪除紀錄指令的日期格式或內容無效。"
-                    
+                    return "❌ 刪除紀錄指令的日期格式或內容無效 (月/日(星期))。"
+                        
                 record_date = parsed_date_data['full_date']
 
                 # A. 查詢目標紀錄的 unique_group_id
@@ -490,7 +506,7 @@ def handle_management_delete(text: str) -> str:
 
                 group_id = group_id_result[0]
 
-                # B. 使用 group_id 刪除同組所有紀錄
+                # B. 使用 group_id 刪除同組所有紀錄 (包括公司攤提)
                 cur.execute("DELETE FROM records WHERE unique_group_id = %s;", (group_id,))
                 
                 return f"✅ 已成功刪除 {member_name} 在 {date_part_str} 的紀錄。共刪除 {cur.rowcount} 筆同組紀錄 (含公司攤提)。"
@@ -510,14 +526,14 @@ def handle_management_delete(text: str) -> str:
             # --- 3. 刪除地點 (刪除 地點 市集) ---
             elif len(parts) == 3 and parts[1] == '地點':
                 loc_name = parts[2]
-                cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,)) # 修正：使用 location_name
+                cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,))
                 if cur.rowcount > 0:
                     return f"✅ 地點 {loc_name} 已成功刪除。"
                 else:
                     return f"💡 地點 {loc_name} 不存在。"
-                
+                    
             else:
-                return "❌ 刪除指令格式錯誤。請檢查指令是否完整。"
+                return "❌ 刪除指令格式錯誤。\n刪除 人名 [人名]\n刪除 地點 [地點名]\n刪除 紀錄 [月/日(星期)] [人名]"
 
         conn.commit()
     except Exception as e:
@@ -531,6 +547,5 @@ def handle_management_delete(text: str) -> str:
 # --- 6. 啟動 APP ---
 
 if __name__ == "__main__":
-    # 在本機測試時，可設置 debug=True。部署到 Railway 時，應使用 Gunicorn。
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
