@@ -12,21 +12,23 @@ from psycopg2 import sql
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 DATABASE_URL = os.getenv('DATABASE_URL')
-COMPANY_NAME = os.getenv('COMPANY_NAME', 'BOSS')
+COMPANY_NAME = os.getenv('COMPANY_NAME', 'BOSS') # 公司的名稱/代號
 
 # 初始化 Flask App 和 LINE BOT API
 app = Flask(__name__)
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and DATABASE_URL):
+    # 僅在非部署環境或測試時可能忽略，部署時必須設定
     app.logger.error("關鍵環境變數未設定。請檢查 LINE_CHANNEL_ACCESS_TOKEN/SECRET 和 DATABASE_URL。")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# --- 2. 資料庫連接與初始化 (V6.4 結構) ---
+# --- 2. 資料庫連接與初始化 (V6.5 結構) ---
 
 def get_db_connection():
     """建立並返回資料庫連接"""
     try:
+        # 使用連接池或單獨連接
         conn = psycopg2.connect(DATABASE_URL)
         return conn
     except Exception as e:
@@ -35,7 +37,7 @@ def get_db_connection():
 
 def init_db(force_recreate=False):
     """
-    初始化資料庫表格 (V6.4 結構)。
+    初始化資料庫表格 (V6.5 結構)。
     """
     conn = get_db_connection()
     if not conn:
@@ -46,15 +48,16 @@ def init_db(force_recreate=False):
             
             if force_recreate:
                 app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格以修正 Schema。資料將遺失。❗❗❗")
+                # 依賴順序刪除
                 cur.execute("DROP TABLE IF EXISTS records;")
                 cur.execute("DROP TABLE IF EXISTS project_members;")
                 cur.execute("DROP TABLE IF EXISTS projects;") 
                 cur.execute("DROP TABLE IF EXISTS monthly_settlements;") 
-                cur.execute("DROP TABLE IF EXISTS monthly_items;")       
                 cur.execute("DROP TABLE IF EXISTS locations;")
+                cur.execute("DROP TABLE IF EXISTS monthly_items;") # 先刪除 locations/monthly_settlements 的外鍵
                 cur.execute("DROP TABLE IF EXISTS members;")
             
-            # 4. 月度成本項目設定表
+            # 4. 月度成本項目設定表 (包含 default_cost)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS monthly_items (
                     item_name VARCHAR(50) PRIMARY KEY,
@@ -64,7 +67,7 @@ def init_db(force_recreate=False):
                 );
             """)
             
-            # 1. 地點設定表
+            # 1. 地點設定表 (包含 linked_monthly_item 外鍵)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS locations (
                     location_name VARCHAR(50) PRIMARY KEY,
@@ -100,7 +103,7 @@ def init_db(force_recreate=False):
                     id SERIAL PRIMARY KEY,
                     item_name VARCHAR(50) REFERENCES monthly_items(item_name) ON DELETE RESTRICT,
                     settlement_date DATE NOT NULL, 
-                    cost_amount INTEGER NOT NULL,
+                    cost_amount INTEGER NOT NULL, # 注意：此處儲存的是最終攤提金額
                     actual_members TEXT NOT NULL, 
                     original_msg TEXT,
                     UNIQUE (settlement_date, item_name)
@@ -134,20 +137,8 @@ def init_db(force_recreate=False):
                 );
             """)
             
+            # 確保公司成員存在
             cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (COMPANY_NAME,))
-            
-            # 預設數據確保外鍵完整性
-            cur.execute("""
-                INSERT INTO monthly_items (item_name, default_cost, default_members, memo)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (item_name) DO NOTHING;
-            """, ('總站固定費', 260, '彼,倫', '總站固定成本'))
-
-            cur.execute("""
-                INSERT INTO locations (location_name, weekday_cost, weekend_cost, linked_monthly_item)
-                VALUES (%s, %s, %s, NULL)
-                ON CONFLICT (location_name) DO NOTHING;
-            """, ('市集', 400, 400))
             
         conn.commit()
         app.logger.info("資料庫初始化完成或已存在 (V6.5)。")
@@ -157,9 +148,10 @@ def init_db(force_recreate=False):
     finally:
         if conn: conn.close()
 
+# ⚠️ 注意: 若遇到資料庫結構錯誤，請**暫時**將 'False' 改為 'True' 來強制重建，然後再改回 'False'。
 init_db(force_recreate=False) 
 
-# --- 3. Webhook 處理 (V6.5 相同) ---
+# --- 3. Webhook 處理 ---
 @app.route("/callback", methods=['POST'])
 def callback():
     """處理 LINE Webhook 傳來的 POST 請求"""
@@ -228,7 +220,7 @@ def handle_message(event):
         TextSendMessage(text=response)
     )
 
-# --- 4. 核心功能實現 (V6.5 修正) ---
+# --- 4. 核心功能實現 (V6.5 邏輯) ---
 
 # [C] 日期解析 (V6.5 修正: 新增 is_standard_mode 標記)
 def parse_record_command(text: str):
@@ -242,6 +234,7 @@ def parse_record_command(text: str):
     current_year = today.year
     input_month = int(record_date_str.split('/')[0])
     
+    # 跨年判斷
     record_year = current_year
     if today.month == 12 and input_month == 1:
         record_year = current_year + 1
@@ -258,6 +251,10 @@ def parse_record_command(text: str):
     # 1. 檢查 '標準' 關鍵字 (V6.5 新增)
     is_standard_mode = False
     temp_text = remaining_text.lower()
+    
+    FILTER_WORDS = ['好', '桌5布4燈1', '架1']
+    
+    # 檢查是否以 '標準' 結尾，且該 '標準' 不在 FILTER_WORDS 中 (雖然此處不太可能發生，但保持邏輯清晰)
     if temp_text.endswith('標準'):
         is_standard_mode = True
         remaining_text = remaining_text[:-2].strip() # 移除 '標準'
@@ -269,7 +266,6 @@ def parse_record_command(text: str):
         manual_cost = int(cost_match.group(1))
         remaining_text = remaining_text[:cost_match.start()].strip() 
     
-    FILTER_WORDS = ['好', '桌5布4燈1', '架1']
     parts = [p for p in remaining_text.split() if p not in FILTER_WORDS] 
     
     if len(parts) < 2:
@@ -293,7 +289,7 @@ def parse_record_command(text: str):
         'is_standard_mode': is_standard_mode # 🌟 V6.5 回傳是否為標準模式
     }, None
 
-# 輔助函數: 獲取地點成本與連動項目 (V6.5 相同)
+# 輔助函數: 獲取地點成本與連動項目
 def get_location_details(conn, location_name, full_date):
     """根據日期和地點獲取成本和連動項目"""
     is_weekend = (full_date.weekday() >= 5) 
@@ -355,7 +351,6 @@ def handle_record_expense(text: str) -> str:
 
                 if should_link:
                     # --- 核心邏輯 A: 連動月成本地點 (例如 總站) ---
-                    # 獲取連動月成本項目的固定金額
                     cur.execute("SELECT default_cost FROM monthly_items WHERE item_name = %s;", (linked_item_name,))
                     fixed_cost_data = cur.fetchone()
                     if not fixed_cost_data:
@@ -371,13 +366,13 @@ def handle_record_expense(text: str) -> str:
                     remainder = C_total % total_sharers
                     
                     C_company_final = C_share_per_person + remainder
-                    member_cost_pool = C_total 
+                    member_cost_pool = C_total # 為了報表計算方便，這裡記錄 C_total
                     
                     # 寫入 Project 紀錄 (記錄總成本 C_total)
                     cur.execute("""
                         INSERT INTO projects (record_date, location_name, total_fixed_cost, member_cost_pool, original_msg)
                         VALUES (%s, %s, %s, %s, %s) RETURNING project_id;
-                    """, (full_date, location_name, C_total, member_cost_pool, text))
+                    """, (full_date, location_name, C_total, C_total, text))
                     project_id = cur.fetchone()[0]
 
                     # 寫入 Project Members
@@ -524,10 +519,9 @@ def handle_record_expense(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [A] 新增/更新功能 (V6.5 相同)
+# [A] 新增/更新功能
 def handle_management_add(text: str) -> str:
     """處理 新增 人名/地點 指令"""
-    # ... (程式碼與 V6.4 相同)
     parts = text.split()
     conn = get_db_connection()
     if not conn: return "❌ 資料庫連接失敗。"
@@ -602,10 +596,9 @@ def handle_management_add(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [H] 新增月度成本項目設定 (V6.5 相同)
+# [H] 新增月度成本項目設定 
 def handle_management_add_monthly_item(text: str) -> str:
-    """處理 新增 月項目 [項目名] [金額] [人名1] [人名2]... 指令 (V6.4 新增金額)"""
-    # ... (程式碼與 V6.4 相同)
+    """處理 新增 月項目 [項目名] [金額] [人名1] [人名2]... 指令"""
     parts = text.split()
     
     if len(parts) < 5 or parts[0] != '新增' or parts[1] != '月項目':
@@ -658,10 +651,9 @@ def handle_management_add_monthly_item(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [I] 新增月度成本實際結算 (V6.5 相同)
+# [I] 新增月度成本實際結算 (包含連動對帳邏輯)
 def handle_settle_monthly_cost(text: str) -> str:
-    """處理月成本實際結算指令 (邏輯與 V6.4 相同)"""
-    # ... (程式碼與 V6.4 相同)
+    """處理月成本實際結算指令"""
     parts = text.split()
     if len(parts) < 5 or parts[0] != '結算' or parts[1] != '月項目':
         return "❌ 結算月項目格式錯誤。\n結算 月項目 [月份 (如 11月)] [項目名] [實際金額] [人名選填 (覆蓋預設)]"
@@ -710,26 +702,24 @@ def handle_settle_monthly_cost(text: str) -> str:
             
             settlement_date = date(current_year, target_month, 1)
 
-            # --- V6.5/V6.4 自動扣除連動活動已攤提的固定費用 ---
-            # 1. 檢查是否有地點連動到此 item_name
+            # --- V6.5/V6.4 自動扣除連動活動已攤提的固定費用 (對帳機制) ---
             cur.execute("SELECT location_name FROM locations WHERE linked_monthly_item = %s;", (item_name,))
             linked_locations = [row[0] for row in cur.fetchall()]
             
             total_fixed_cost_deducted = 0
             
             if linked_locations:
-                # 2. 查找當月已紀錄的連動專案天數
+                # 查找當月已紀錄的連動專案天數
                 cur.execute("""
                     SELECT COUNT(p.project_id) FROM projects p
                     WHERE p.location_name = ANY(%s)
                       AND date_part('month', p.record_date) = %s
-                      AND p.member_cost_pool = p.total_fixed_cost; -- 判斷是否為連動攤提模式 (連動模式下這兩欄位相等)
+                      AND p.member_cost_pool = p.total_fixed_cost; 
                 """, (linked_locations, target_month))
                 
                 linked_activity_days = cur.fetchone()[0]
                 
                 if linked_activity_days > 0:
-                    # 每個連動活動日，都包含了此月項目的固定成本 (default_cost)
                     total_fixed_cost_deducted = linked_activity_days * default_cost
             
             # 3. 計算最終攤提金額
@@ -762,7 +752,7 @@ def handle_settle_monthly_cost(text: str) -> str:
             cur.execute("""
                 INSERT INTO monthly_settlements (item_name, settlement_date, cost_amount, actual_members, original_msg)
                 VALUES (%s, %s, %s, %s, %s) RETURNING id;
-            """, (item_name, settlement_date, final_cost_to_settle, actual_members_str, text)) # 注意：cost_amount 寫入的是最終攤提金額
+            """, (item_name, settlement_date, final_cost_to_settle, actual_members_str, text))
             monthly_settlement_id = cur.fetchone()[0]
 
             # 寫入 Records
@@ -800,9 +790,9 @@ def handle_settle_monthly_cost(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [B] 清單查詢功能 (V6.5 相同)
+# [B] 清單查詢功能
 def handle_management_list(text: str) -> str:
-    # ... (程式碼與 V6.4 相同)
+    """處理清單指令"""
     parts = text.split()
     if len(parts) != 2 or parts[0] != '清單':
         return "❌ 清單指令格式錯誤。請使用: 清單 人名, 清單 地點, 清單 月項目 或 清單 月結算。"
@@ -873,10 +863,9 @@ def handle_management_list(text: str) -> str:
     finally:
         if conn: conn.close()
         
-# [E] 費用統計功能 (V6.5 相同)
+# [E] 費用統計功能
 def handle_management_stat(text: str) -> str:
     """處理費用統計指令"""
-    # ... (程式碼與 V6.4 相同)
     parts = text.split()
     if len(parts) != 3 or parts[0] != '統計':
         return "❌ 統計指令格式錯誤。請使用: 統計 [人名/公司] [月份 (例如 9月)]。"
@@ -920,10 +909,9 @@ def handle_management_stat(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [J] 報表匯出功能 (V6.5 相同)
+# [J] 報表匯出功能 
 def handle_report(text: str) -> str:
     """處理報表指令"""
-    # ... (程式碼與 V6.4 相同)
     parts = text.split()
     if len(parts) != 2 or parts[0] != '報表':
         return "❌ 報表指令格式錯誤。請使用: 報表 [月份 (例如 11月)]。"
@@ -1013,10 +1001,9 @@ def handle_report(text: str) -> str:
     finally:
         if conn: conn.close()
 
-# [F] 刪除功能 (V6.5 相同)
+# [F] 刪除功能
 def handle_management_delete(text: str) -> str:
     """處理刪除指令"""
-    # ... (程式碼與 V6.4 相同)
     parts = text.split()
     conn = get_db_connection()
     if not conn: return "❌ 資料庫連接失敗。"
@@ -1028,7 +1015,6 @@ def handle_management_delete(text: str) -> str:
                 location_name = parts[3]
                 
                 temp_text = f"{date_part_str} 測試人名 {location_name}"
-                # 使用 V6.5 的解析器 (但忽略 is_standard_mode)
                 parsed_date_data, _ = parse_record_command(temp_text) 
                 
                 if not parsed_date_data:
@@ -1122,3 +1108,9 @@ def handle_management_delete(text: str) -> str:
         return f"❌ 資料庫操作失敗: {e}"
     finally:
         if conn: conn.close()
+
+# --- 5. Flask App 運行 ---
+if __name__ == "__main__":
+    # 如果您需要在本地運行，可以取消註釋以下行
+    # app.run(host='0.0.0.0', port=os.getenv('PORT', 5000))
+    pass
