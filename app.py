@@ -683,11 +683,17 @@ def handle_settle_monthly_cost(text: str) -> str:
             if not final_members:
                 return "❌ 無法結算。分攤人名單不能為空。"
                 
-            current_year = date.today().year
+            current_date = date.today()
+            current_year = current_date.year
             
-            # 調整跨年月份
-            if target_month < date.today().month and (date.today().month >= 11 or date.today().month == 1):
+            # 調整跨年月份 (修正 V7.1 原始邏輯中的錯誤判斷，確保年份準確)
+            # 1. 處理年末到年初的跳年 (例如: 11/12月結算1月，應為下一年度)
+            if target_month == 1 and current_date.month in (11, 12):
                  current_year += 1
+            # 2. 處理年初結算去年底的月份 (例如: 1/2月結算12月，應為上一年度)
+            elif target_month == 12 and current_date.month in (1, 2):
+                 current_year -= 1
+            # 3. 否則，預設為當前年度的月份
             
             settlement_date = date(current_year, target_month, 1)
 
