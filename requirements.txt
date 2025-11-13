@@ -1,5 +1,4 @@
-Flask
+flask
 line-bot-sdk
-psycopg2-binary  # 連接 PostgreSQL
-gunicorn         # 部署時用的 Web 伺服器
-python-dotenv    # (可選，本地測試用)
+psycopg2-binary  # 用來連接 PostgreSQL
+gunicorn         # 生產環境下的網頁伺服器

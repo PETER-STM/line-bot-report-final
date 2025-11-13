@@ -1,659 +1,173 @@
 import os
-import re
-from datetime import datetime, date
+import datetime
+import psycopg2
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-import psycopg2
-from psycopg2 import sql
 
-# --- 1. 環境變數與設定 ---
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
-LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
-DATABASE_URL = os.getenv('DATABASE_URL')
-COMPANY_NAME = os.getenv('COMPANY_NAME', 'BOSS')
+# --- 1. 設定 & 初始化 ---
+# ⚠️ 這些應從 Railway 的環境變數中設定
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
+# Railway 會自動將連線字串設定為 DATABASE_URL
+DATABASE_URL = os.environ.get('DATABASE_URL') 
+# 您指定要查詢的日期 (注意格式 YYYY-MM-DD)
+TARGET_DATE = "2025-11-09" 
 
-# 初始化 Flask App 和 LINE BOT API
-app = Flask(__name__)
-if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and DATABASE_URL):
-    app.logger.error("關鍵環境變數未設定。請檢查 LINE_CHANNEL_ACCESS_TOKEN/SECRET 和 DATABASE_URL。")
+# 檢查必要的環境變數
+if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET or not DATABASE_URL:
+    print("ERROR: Missing required environment variables.")
+    # 在實際部署中，這裡應拋出錯誤或確保變數已設定
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+app = Flask(__name__)
 
-# --- 2. 資料庫連接與初始化 ---
-
+# --- 2. 資料庫連線函式 ---
 def get_db_connection():
-    """建立並返回資料庫連接"""
+    """建立並回傳 PostgreSQL 連線物件"""
     try:
+        # 使用 psycopg2 連接到 PostgreSQL
         conn = psycopg2.connect(DATABASE_URL)
+        # 設定 row_factory 以便能以欄位名稱存取結果 (類似字典)
+        # 注意: psycopg2 預設回傳 tuple，所以後續查詢時需要調整存取方式
         return conn
     except Exception as e:
-        app.logger.error(f"資料庫連接失敗: {e}")
+        app.logger.error(f"PostgreSQL 連線失敗: {e}")
         return None
 
-def init_db(force_recreate=False):
-    """
-    初始化資料庫表格 (地點、成員、專案、紀錄)。
-    當 force_recreate=False 時，只會建立不存在的表格 (IF NOT EXISTS)。
-    """
+def init_db():
+    """初始化資料庫：建立 Users 和 Daily_Records 表格"""
     conn = get_db_connection()
     if not conn:
         return
         
-    try:
-        with conn.cursor() as cur:
-            
-            # --- ❗ 永久移除強制重建，只在明確要求時執行 ---
-            if force_recreate:
-                app.logger.warning("❗❗❗ 正在執行強制刪除並重建所有表格以修正 Schema。資料將遺失。❗❗❗")
-                cur.execute("DROP TABLE IF EXISTS records;")
-                cur.execute("DROP TABLE IF EXISTS project_members;")
-                cur.execute("DROP TABLE IF EXISTS projects;") 
-                cur.execute("DROP TABLE IF EXISTS locations;")
-                cur.execute("DROP TABLE IF EXISTS members;")
-            # ---------------------------------------------------
-                
-            # 1. 地點設定表
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS locations (
-                    location_name VARCHAR(50) PRIMARY KEY,
-                    weekday_cost INTEGER NOT NULL,
-                    weekend_cost INTEGER NOT NULL
-                );
-            """)
-            # 2. 成員名單表
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS members (
-                    name VARCHAR(50) PRIMARY KEY
-                );
-            """)
+    cursor = conn.cursor()
+    
+    # 建立 Users 表 (用戶名單)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Users (
+            user_id TEXT PRIMARY KEY,
+            name TEXT
+        );
+    """)
+    
+    # 建立 Daily_Records 表 (心得記錄)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Daily_Records (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT,
+            record_date DATE,
+            content TEXT,
+            FOREIGN KEY(user_id) REFERENCES Users(user_id)
+        );
+    """)
+    
+    # 範例：手動插入需要登記的人 (您需要替換成您實際的用戶名單及 LINE User ID)
+    # ****************** 重要：請您替換此處的 User ID ******************
+    # 假設 '伊森' 的 LINE user_id 是 'U1234567890abcdef' (這是一個範例，您需要實際取得)
+    # cursor.execute("INSERT INTO Users (user_id, name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING;", ('U1234567890abcdef', '伊森'))
+    # cursor.execute("INSERT INTO Users (user_id, name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING;", ('Ufedcba0987654321', 'Ariel'))
+    # *****************************************************************
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-            # 3. 專案/活動表
-            cur.execute("""
-                CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; 
-                CREATE TABLE IF NOT EXISTS projects (
-                    project_id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-                    record_date DATE NOT NULL,
-                    location_name VARCHAR(50) REFERENCES locations(location_name) ON DELETE RESTRICT,
-                    total_fixed_cost INTEGER NOT NULL,
-                    member_cost_pool INTEGER NOT NULL,
-                    original_msg TEXT
-                );
-            """)
-            
-            # 4. 專案參與成員表
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS project_members (
-                    project_id UUID REFERENCES projects(project_id) ON DELETE CASCADE,
-                    member_name VARCHAR(50) REFERENCES members(name) ON DELETE CASCADE,
-                    PRIMARY KEY (project_id, member_name)
-                );
-            """)
+# 啟動時執行資料庫初始化
+with app.app_context():
+    init_db()
 
-            # 5. 費用紀錄表
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS records (
-                    id SERIAL PRIMARY KEY,
-                    record_date DATE NOT NULL,
-                    member_name VARCHAR(50) REFERENCES members(name) ON DELETE CASCADE,
-                    project_id UUID REFERENCES projects(project_id) ON DELETE CASCADE,
-                    cost_paid INTEGER NOT NULL,
-                    original_msg TEXT
-                );
-            """)
-            
-            # 確保 '公司' (BOSS) 作為分攤單位存在於 members 表
-            cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (COMPANY_NAME,))
-            
-            # 預先插入 '市集' 避免外鍵錯誤，並給定預設值 (400)
-            cur.execute("""
-                INSERT INTO locations (location_name, weekday_cost, weekend_cost)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (location_name) DO NOTHING;
-            """, ('市集', 400, 400))
-            
-        conn.commit()
-        app.logger.info("資料庫初始化完成或已存在。")
-    except Exception as e:
-        app.logger.error(f"資料庫初始化失敗: {e}")
-    finally:
-        if conn: conn.close()
-
-# ⚠️ 最終修正：資料庫初始化，不執行強制重建。
-init_db(force_recreate=False) 
-
-# --- 3. Webhook 處理 (包含指令提取與中/英文括號支援) ---
+# --- 3. LINE Webhook 處理 ---
 @app.route("/callback", methods=['POST'])
 def callback():
-    """處理 LINE Webhook 傳來的 POST 請求"""
-    signature = request.headers.get('X-Line-Signature', '')
+    signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
     app.logger.info("Request body: " + body)
-
+    
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        app.logger.error("Invalid signature.")
+        app.logger.error("Invalid signature. Check token/secret.")
         abort(400)
+    except Exception as e:
+        app.logger.error(f"Webhook 處理錯誤: {e}")
+        abort(500)
+        
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    # 接收到的原始文字，可能包含雜訊
-    original_text = event.message.text.strip()
-    reply_token = event.reply_token
-    response = ""
-
-    try:
-        # 嘗試從任何位置提取 "日期(星期) [地點] [人名...]" 格式的核心指令
-        # 【支援中/英文括號】: [\(\（]\w[\)\）]
-        record_match = re.search(r'(\d{1,2}/\d{1,2}[\(\（]\w[\)\）])\s+([^\s]+.*)', original_text)
-
-        if original_text.startswith('新增') or original_text.startswith('刪除') or original_text.startswith('清單') or original_text.startswith('統計'):
-            # 對於管理指令，仍然要求精準匹配
-            text = original_text.split('\n')[0].strip() 
+    text = event.message.text.strip()
+    user_id = event.source.user_id
+    
+    reply_text = "我只聽得懂 '心得：[內容]' 和 '查詢未登記'"
+    
+    conn = get_db_connection()
+    if not conn:
+        reply_text = "❌ 內部系統錯誤：無法連接到資料庫。"
+    else:
+        cursor = conn.cursor()
+        
+        if text.startswith('心得：'):
+            # --- 處理心得登記 (自動使用今天的日期) ---
+            content = text[3:].strip()
+            # 取得當前日期 (格式 YYYY-MM-DD)
+            today_date = datetime.date.today().strftime('%Y-%m-%d')
             
-            if text.startswith('新增'):
-                response = handle_management_add(text)
-            elif text.startswith('刪除'):
-                response = handle_management_delete(text)
-            elif text.startswith('清單'):
-                response = handle_management_list(text)
-            elif text.startswith('統計'):
-                response = handle_management_stat(text)
-        elif original_text == '測試':
-            response = "Bot 正常運作中！資料庫連接狀態良好。"
-        elif record_match:
-            # 提取出核心的紀錄指令部分 (日期部分 + 後續內容)
-            record_text = record_match.group(1) + " " + record_match.group(2)
-            # 將提取出來的指令傳給處理函數
-            response = handle_record_expense(record_text)
-        else:
-            response = "無法識別的指令格式。請輸入 '清單 地點' 或 '9/12(五) 人名 地點' (v6-順序修正)。"
+            # 檢查用戶是否已在名單中
+            cursor.execute("SELECT name FROM Users WHERE user_id = %s", (user_id,))
+            user_info = cursor.fetchone()
+
+            if user_info:
+                try:
+                    # 嘗試插入記錄
+                    cursor.execute(
+                        "INSERT INTO Daily_Records (user_id, record_date, content) VALUES (%s, %s, %s);",
+                        (user_id, today_date, content)
+                    )
+                    conn.commit()
+                    reply_text = f"✅ 心得登記成功！\n📅 日期: {today_date}"
+                except Exception as e:
+                    # 這裡通常是重複登記的錯誤，或是其他資料庫錯誤
+                    app.logger.error(f"登記失敗: {e}")
+                    reply_text = f"⚠️ 登記失敗，可能是您今天 ({today_date}) 已經登記過了，或發生資料庫錯誤。"
+            else:
+                reply_text = "🤔 您尚未在登記名單中，請先聯繫管理員將您的 LINE ID 加入 Users 表格。"
+
+        elif text == '查詢未登記':
+            # --- 處理查詢特定日期未登記名單 ---
+            query_date = TARGET_DATE
             
-    except Exception as e:
-        app.logger.error(f"處理指令失敗: {e}")
-        response = f"指令處理發生未知錯誤: {e}"
+            # 查詢 Users 表中，user_id 不在 Daily_Records 中且日期為 query_date 的用戶
+            cursor.execute("""
+                SELECT name FROM Users
+                WHERE user_id NOT IN (
+                    SELECT user_id FROM Daily_Records WHERE record_date = %s
+                )
+            """, (query_date,))
+            
+            not_recorded_users = [row[0] for row in cursor.fetchall()] # psycopg2 預設回傳 tuple，row[0] 為 name
 
-    # ❗ 錯誤防護: 確保 response 不是空字串
-    if not response:
-        response = "處理過程中發生未預期的錯誤，請檢查指令格式或回報問題。"
-
+            if not_recorded_users:
+                names = '、'.join(not_recorded_users)
+                reply_text = f"📅 **{query_date}** 尚未登記心得名單：\n**{names}**"
+            else:
+                reply_text = f"🎉 **{query_date}** 所有人都已登記完成！"
+        
+        # 關閉連線
+        cursor.close()
+        conn.close()
+            
+    # 回覆訊息
     line_bot_api.reply_message(
-        reply_token,
-        TextSendMessage(text=response)
+        event.reply_token,
+        TextSendMessage(text=reply_text)
     )
 
-# --- 4. 核心功能實現 ---
-
-# [C] 日期解析 (已修正：人名/地點順序反轉 and 雜訊過濾)
-def parse_record_command(text: str):
-    """
-    解析費用紀錄指令。格式: [月/日(星期)] [人名1] [地點名] [人名2]... [金額(可選)]
-    """
-    # 支援中/英文括號: [\(\（](\w)[\)\）]
-    date_match = re.match(r'^(\d{1,2}/\d{1,2})[\(\（](\w)[\)\）]', text)
-    if not date_match:
-        return None, "日期格式錯誤 (月/日(星期))"
-
-    record_date_str = date_match.group(1) 
-    
-    # 年份自動判斷 (邏輯略)
-    today = date.today()
-    current_year = today.year
-    input_month = int(record_date_str.split('/')[0])
-    
-    record_year = current_year
-    if today.month == 12 and input_month == 1 or (today.month > 1 and input_month < today.month):
-        record_year = current_year + 1
-    elif today.month == 1 and input_month == 12 or (today.month > 1 and input_month > today.month):
-        record_year = current_year - 1
-        
-    try:
-        full_date = datetime.strptime(f'{record_year}/{record_date_str}', '%Y/%m/%d').date()
-    except ValueError:
-        return None, "日期不存在 (例如 2月30日)"
-    
-    remaining_text = text[date_match.end():].strip() 
-    
-    manual_cost = None
-    cost_match = re.search(r'\s(\d+)$', remaining_text)
-    if cost_match:
-        manual_cost = int(cost_match.group(1))
-        remaining_text = remaining_text[:cost_match.start()].strip() 
-    
-    # 🌟 雜訊過濾器：過濾掉非指令詞彙
-    FILTER_WORDS = ['好', '桌5布4燈1', '架1']
-    parts = [p for p in remaining_text.split() if p not in FILTER_WORDS] 
-    
-    if len(parts) < 2:
-        return None, "請至少指定一位人名和一個地點"
-
-    # --- 關鍵修正：現在第一個是人名 (人名1)，第二個是地點名 ---
-    member_names = [parts[0]] 
-    location_name = parts[1]  
-    
-    # 後面所有詞都當作是人名
-    if len(parts) > 2:
-        member_names.extend(parts[2:])
-
-    if COMPANY_NAME in member_names:
-        return None, f"請勿在紀錄中包含 {COMPANY_NAME}，它會自動加入計算。"
-
-    return {
-        'full_date': full_date,
-        'day_of_week': date_match.group(2), 
-        'member_names': member_names,
-        'location_name': location_name,
-        'manual_cost': manual_cost
-    }, None
-
-# 輔助函數: 獲取地點成本
-def get_location_cost(conn, location_name, full_date):
-    """根據日期和地點獲取成本"""
-    is_weekend = (full_date.weekday() >= 5) 
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT weekday_cost, weekend_cost FROM locations WHERE location_name = %s", (location_name,))
-            result = cur.fetchone()
-        
-        if not result: return None
-        weekday_cost, weekend_cost = result
-        return weekend_cost if is_weekend else weekday_cost
-    except Exception as e:
-        app.logger.error(f"獲取地點成本失敗: {e}")
-        return None
-
-# [D] 費用紀錄功能 (Project-Based 邏輯)
-def handle_record_expense(text: str) -> str:
-    """處理費用紀錄指令，實作 Project-Based 兩階段分攤邏輯。"""
-    parsed_data, error = parse_record_command(text)
-    if error:
-        return f"❌ 指令解析失敗: {error}"
-        
-    full_date = parsed_data['full_date']
-    new_members = parsed_data['member_names'] # 這次指令新增的人員
-    location_name = parsed_data['location_name']
-    manual_cost = parsed_data['manual_cost']
-
-    conn = get_db_connection()
-    if not conn: return "❌ 資料庫連接失敗。"
-
-    try:
-        with conn.cursor() as cur:
-            # 1. 檢查該地點/日期是否已有專案 (Project)
-            cur.execute("""
-                SELECT p.project_id, p.member_cost_pool
-                FROM projects p 
-                WHERE p.record_date = %s AND p.location_name = %s;
-            """, (full_date, location_name))
-            
-            project_data = cur.fetchone()
-            
-            # --- 情況 A: 專案已存在 (後續紀錄/加入成員) ---
-            if project_data:
-                project_id, member_cost_pool = project_data
-                
-                # 檢查新成員是否已在專案中，並將未加入的成員加入
-                cur.execute("""
-                    SELECT member_name FROM project_members WHERE project_id = %s;
-                """, (project_id,))
-                current_members = [row[0] for row in cur.fetchall()]
-                
-                members_to_add = [m for m in new_members if m not in current_members]
-                
-                if not members_to_add and len(new_members) > 0:
-                    return f"💡 {location_name} 在 {full_date.strftime('%m/%d')} 的紀錄已存在，且所有指定成員都已加入分攤名單。"
-
-                # 排除 COMPANY_NAME 和已在名單中的成員
-                all_business_members = sorted(list(set(current_members) | set(new_members)))
-                
-                N = len(all_business_members)
-                C_member_individual = 0
-                remainder_members = 0
-
-                if N > 0:
-                    C_member_individual = member_cost_pool // N
-                    remainder_members = member_cost_pool % N
-
-                # 重新計算 BOSS 的最終攤提金額
-                C_company_final = member_cost_pool + remainder_members
-                
-                # 2. 更新 project_members (加入新成員)
-                for member in members_to_add:
-                    cur.execute("""
-                        INSERT INTO project_members (project_id, member_name) VALUES (%s, %s) 
-                        ON CONFLICT (project_id, member_name) DO NOTHING;
-                    """, (project_id, member))
-
-                # 3. 清除並更新 records 表 (重新計算攤提)
-                cur.execute("DELETE FROM records WHERE project_id = %s;", (project_id,))
-                
-                # 寫入 BOSS 紀錄
-                cur.execute("""
-                    INSERT INTO records (record_date, member_name, project_id, cost_paid, original_msg)
-                    VALUES (%s, %s, %s, %s, %s);
-                """, (full_date, COMPANY_NAME, project_id, C_company_final, text))
-
-                # 寫入每個業務員的紀錄
-                for member in all_business_members:
-                    cur.execute("""
-                        INSERT INTO records (record_date, member_name, project_id, cost_paid, original_msg)
-                        VALUES (%s, %s, %s, %s, %s);
-                    """, (full_date, member, project_id, C_member_individual, text))
-                
-                conn.commit()
-                return f"""✅ 成功加入新成員至 {location_name} ({full_date.strftime('%m/%d')}) 專案。
---------------------------------
-總業務員人數已更新為 {N} 位。
-每位業務員應攤提費用: {C_member_individual}
-{COMPANY_NAME} 應攤提費用: {C_company_final:,} (固定成本 + 餘數)"""
-
-
-            # --- 情況 B: 專案不存在 (初次紀錄/Project Lead) ---
-            else:
-                # 1. 取得總成本 C
-                C = manual_cost if manual_cost is not None else get_location_cost(conn, location_name, full_date)
-                if C is None:
-                    return f"❌ 地點 '{location_name}' 尚未設定成本，請先使用 '新增 地點' 指令。"
-
-                # 2. 核心計算邏輯 (兩階段分攤)
-                N = len(new_members)
-                C_unit_total = C // 2
-                remainder_total = C % 2 
-                
-                C_company_stage1 = C_unit_total + remainder_total # BOSS 50% + 總餘數
-                member_cost_pool = C_unit_total # 業務員總成本池 (50%)
-                
-                C_member_individual = 0
-                remainder_members = 0
-                
-                if N > 0:
-                    C_member_individual = member_cost_pool // N
-                    remainder_members = member_cost_pool % N
-                    
-                C_company_final = C_company_stage1 + remainder_members # BOSS 最終攤提 (含業務員分攤餘數)
-
-                # 3. 寫入 projects 表 (取得 project_id)
-                cur.execute("""
-                    INSERT INTO projects (record_date, location_name, total_fixed_cost, member_cost_pool, original_msg)
-                    VALUES (%s, %s, %s, %s, %s) RETURNING project_id;
-                """, (full_date, location_name, C, member_cost_pool, text))
-                project_id = cur.fetchone()[0]
-
-                # 4. 寫入 project_members 表
-                for member in new_members:
-                    cur.execute("""
-                        INSERT INTO project_members (project_id, member_name) VALUES (%s, %s);
-                    """, (project_id, member))
-
-                # 5. 寫入 records 表 (BOSS 和所有業務員)
-                cur.execute("""
-                    INSERT INTO records (record_date, member_name, project_id, cost_paid, original_msg)
-                    VALUES (%s, %s, %s, %s, %s);
-                """, (full_date, COMPANY_NAME, project_id, C_company_final, text))
-
-                for member in new_members:
-                    cur.execute("""
-                        INSERT INTO records (record_date, member_name, project_id, cost_paid, original_msg)
-                        VALUES (%s, %s, %s, %s, %s);
-                    """, (full_date, member, project_id, C_member_individual, text))
-                
-                conn.commit()
-                
-                return f"""✅ 啟動 {location_name} 專案 ({full_date.strftime('%m/%d')})。總成本 {C}。
---------------------------------
-公司 ({COMPANY_NAME}) 應攤提費用: {C_company_final:,}
-{N} 位業務員 每人應攤提費用: {C_member_individual}
-💡 後續相同日期/地點的紀錄，請以相同格式輸入，將會自動加入此專案分攤。"""
-        
-    except ValueError:
-        conn.rollback()
-        return "❌ 金額格式錯誤。"
-    except psycopg2.errors.ForeignKeyViolation as fke:
-        conn.rollback()
-        return f"❌ 紀錄失敗：人名或地點不存在。請先使用 '新增人名' 或 '新增 地點'。"
-    except Exception as e:
-        conn.rollback()
-        app.logger.error(f"費用紀錄資料庫錯誤: {e}")
-        return f"❌ 處理費用紀錄發生錯誤: {e}"
-    finally:
-        if conn: conn.close()
-        
-# [A] 新增/更新功能
-def handle_management_add(text: str) -> str:
-    """處理 新增 地點/人名 指令"""
-    parts = text.split()
-    conn = get_db_connection()
-    if not conn: return "❌ 資料庫連接失敗。"
-
-    try:
-        with conn.cursor() as cur:
-            # 處理：新增人名 [人名] (共 2 部分)
-            if len(parts) == 2 and parts[0] == '新增人名':
-                member_name = parts[1]
-                cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (member_name,))
-                if cur.rowcount > 0:
-                    conn.commit()
-                    return f"✅ 已成功新增成員：{member_name}。"
-                else:
-                    return f"💡 成員 {member_name} 已存在。"
-
-            # 處理：新增 地點 [地點名] [成本] (單一費率，共 4 部分)
-            elif len(parts) == 4 and parts[1] == '地點':
-                loc_name, cost_val = parts[2], int(parts[3])
-                cur.execute("""
-                    INSERT INTO locations (location_name, weekday_cost, weekend_cost)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
-                """, (loc_name, cost_val, cost_val))
-                conn.commit()
-                return f"✅ 地點「{loc_name}」已設定成功，平日/假日成本皆為 {cost_val}。"
-
-            # 處理：新增 地點 [地點名] [平日成本] [假日成本] (雙費率，共 5 部分)
-            elif len(parts) == 5 and parts[1] == '地點':
-                loc_name = parts[2]
-                weekday_cost_val = int(parts[3])
-                weekend_cost_val = int(parts[4])
-                
-                cur.execute("""
-                    INSERT INTO locations (location_name, weekday_cost, weekend_cost)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (location_name) DO UPDATE SET weekday_cost = EXCLUDED.weekday_cost, weekend_cost = EXCLUDED.weekend_cost;
-                """, (loc_name, weekday_cost_val, weekend_cost_val))
-                conn.commit()
-                return f"✅ 地點「{loc_name}」已設定成功，平日 {weekday_cost_val}，假日 {weekend_cost_val}。"
-                
-            else:
-                return "❌ 新增指令格式錯誤。\n新增人名 [人名]\n新增 地點 [地點名] [成本](單一)\n新增 地點 [地點名] [平日成本] [假日成本](雙費率)"
-
-    except ValueError:
-        return "❌ 成本金額必須是數字。"
-    except Exception as e:
-        conn.rollback()
-        app.logger.error(f"新增指令資料庫錯誤: {e}")
-        return f"❌ 資料庫操作失敗: {e}"
-    finally:
-        if conn: conn.close()
-        
-# [B] 清單查詢功能
-def handle_management_list(text: str) -> str:
-    """處理 清單 人名/地點 指令，查詢並列出設定"""
-    parts = text.split()
-    if len(parts) != 2 or parts[0] != '清單':
-        return "❌ 清單指令格式錯誤。請使用: 清單 人名 或 清單 地點。"
-        
-    list_type = parts[1].lower()
-    conn = get_db_connection()
-    if not conn: return "❌ 資料庫連接失敗。"
-
-    try:
-        with conn.cursor() as cur:
-            if list_type == '人名':
-                cur.execute("SELECT name FROM members ORDER BY name;")
-                members = [row[0] for row in cur.fetchall()]
-                
-                if not members: return "📋 目前沒有任何已設定的人名或業務員。"
-                
-                member_list_str = "、".join(members)
-                return f"📋 **現有成員 (業務員/公司):**\n{member_list_str}"
-
-            elif list_type == '地點':
-                cur.execute("SELECT location_name, weekday_cost, weekend_cost FROM locations ORDER BY location_name;")
-                locations = cur.fetchall()
-                
-                if not locations: return "📋 目前沒有任何已設定的地點。"
-
-                response = "📋 **現有地點及其成本:**\n"
-                for name, weekday_cost, weekend_cost in locations:
-                    if weekday_cost == weekend_cost:
-                        response += f"• {name}: {weekday_cost} (單一費率)\n"
-                    else:
-                        response += f"• {name}: 平日 {weekday_cost} / 假日 {weekend_cost}\n"
-                return response.strip()
-
-            else:
-                return "❌ 無法識別的清單類別。請輸入 '清單 人名' 或 '清單 地點'。"
-
-    except Exception as e:
-        app.logger.error(f"清單指令資料庫錯誤: {e}")
-        return f"❌ 查詢清單發生錯誤: {e}"
-    finally:
-        if conn: conn.close()
-        
-# [E] 費用統計功能
-def handle_management_stat(text: str) -> str:
-    """處理 統計 [人名/公司] [月份] 指令"""
-    parts = text.split()
-    if len(parts) != 3 or parts[0] != '統計':
-        return "❌ 統計指令格式錯誤。請使用: 統計 [人名/公司] [月份 (例如 9月)]。"
-        
-    target_name = parts[1]
-    month_str = parts[2].replace('月', '').strip()
-
-    try:
-        target_month = int(month_str)
-        if not (1 <= target_month <= 12):
-            raise ValueError
-    except ValueError:
-        return "❌ 月份格式錯誤。請輸入有效的數字月份 (1 到 12)。"
-        
-    conn = get_db_connection()
-    if not conn: return "❌ 資料庫連接失敗。"
-
-    try:
-        with conn.cursor() as cur:
-            # 檢查人名是否存在
-            cur.execute("SELECT name FROM members WHERE name = %s", (target_name,))
-            if cur.fetchone() is None:
-                return f"❌ 無法統計。成員 {target_name} 不存在於名單中。"
-
-            # 查詢特定成員在特定月份的總費用
-            cur.execute("""
-                SELECT SUM(cost_paid)
-                FROM records r
-                JOIN projects p ON r.project_id = p.project_id
-                WHERE r.member_name = %s 
-                  AND date_part('month', r.record_date) = %s;
-            """, (target_name, target_month))
-            
-            total_cost = cur.fetchone()[0]
-            
-            if total_cost is None:
-                return f"✅ {target_name} 在 {target_month} 月份沒有任何費用紀錄。"
-            
-            # 使用千位數分隔符號讓數字更易讀
-            return f"📈 **{target_name} {target_month} 月份總費用統計**：\n總通路費用為：**{total_cost:,}** 元。"
-
-    except Exception as e:
-        app.logger.error(f"統計指令資料庫錯誤: {e}")
-        return f"❌ 查詢統計數據發生錯誤: {e}"
-    finally:
-        if conn: conn.close()
-        
-# [F] 刪除功能
-def handle_management_delete(text: str) -> str:
-    """處理 刪除 地點/人名/紀錄 指令"""
-    parts = text.split()
-    conn = get_db_connection()
-    if not conn: return "❌ 資料庫連接失敗。"
-    
-    try:
-        with conn.cursor() as cur:
-            # --- 1. 刪除紀錄 (刪除 紀錄 月/日(星期) 地點名) ---
-            if len(parts) == 4 and parts[1] == '紀錄':
-                date_part_str = parts[2]
-                location_name = parts[3]
-                
-                # 由於解析順序已改變，這裡要模擬新的指令格式來獲取日期
-                temp_text = f"{date_part_str} 測試人名 {location_name}"
-                parsed_date_data, _ = parse_record_command(temp_text)
-                
-                if not parsed_date_data:
-                    return "❌ 刪除紀錄指令的日期格式或地點名稱無效 (月/日(星期) 地點名)。"
-                        
-                record_date = parsed_date_data['full_date']
-
-                # A. 查詢目標 Project 的 project_id
-                cur.execute("""
-                    SELECT project_id FROM projects
-                    WHERE record_date = %s AND location_name = %s
-                    LIMIT 1;
-                """, (record_date, location_name))
-                
-                project_id_result = cur.fetchone()
-
-                if not project_id_result:
-                    return f"💡 找不到 {location_name} 在 {date_part_str} 的專案紀錄。"
-
-                project_id = project_id_result[0]
-
-                # B. 刪除 Project (會級聯刪除 records 和 project_members)
-                cur.execute("DELETE FROM projects WHERE project_id = %s;", (project_id,))
-                
-                conn.commit()
-                return f"✅ 已成功刪除 {location_name} 在 {date_part_str} 的整個專案紀錄 (包含所有成員攤提)。"
-
-            # --- 2. 刪除成員 (刪除 人名 彼) ---
-            elif len(parts) == 3 and parts[1] == '人名':
-                member_name = parts[2]
-                if member_name == COMPANY_NAME:
-                    return f"❌ 無法刪除系統專用成員 {COMPANY_NAME}。"
-                    
-                # 由於 ON DELETE CASCADE，刪除成員會自動刪除相關紀錄
-                cur.execute("DELETE FROM members WHERE name = %s;", (member_name,))
-                if cur.rowcount > 0:
-                    conn.commit()
-                    return f"✅ 成員 {member_name} 已從名單中刪除。所有相關費用紀錄也已同步清除。" 
-                else:
-                    return f"💡 名單中找不到 {member_name}。"
-
-            # --- 3. 刪除地點 (刪除 地點 市集) ---
-            elif len(parts) == 3 and parts[1] == '地點':
-                loc_name = parts[2]
-                # 由於 locations 被 projects 引用，若刪除會導致 RestrictViolation
-                cur.execute("DELETE FROM locations WHERE location_name = %s;", (loc_name,))
-                if cur.rowcount > 0:
-                    conn.commit()
-                    return f"✅ 地點 {loc_name} 已成功刪除。"
-                else:
-                    return f"💡 地點 {loc_name} 不存在。"
-                    
-            else:
-                return "❌ 刪除指令格式錯誤。\n刪除 人名 [人名]\n刪除 地點 [地點名]\n刪除 紀錄 [月/日(星期)] [地點名]"
-
-    except psycopg2.errors.RestrictViolation:
-        conn.rollback()
-        return "❌ 地點刪除失敗: 仍有專案紀錄引用此地點。請先刪除相關的 '紀錄'。"
-    except Exception as e:
-        conn.rollback()
-        app.logger.error(f"刪除指令資料庫錯誤: {e}")
-        return f"❌ 資料庫操作失敗: {e}"
-    finally:
-        if conn: conn.close()
-
-
-# --- 5. 啟動 APP ---
-# (此處保持為空，因為使用 gunicorn 啟動)
+if __name__ == "__main__":
+    # 本機測試 (如果要在本機執行，您需要使用外部 IP 位址連線到 Railway 的 DB，或者使用 Ngrok 等工具測試 LINE Webhook)
+    print("WARNING: 本機運行時，請確保已設定環境變數，並可連線到 Railway DB。")
+    # app.run(debug=True, port=8000)
+    pass
