@@ -1,4 +1,8 @@
-flask
+fastapi
+uvicorn[standard]
+databases[postgresql]
+sqlalchemy
+python-multipart
+python-dotenv
 line-bot-sdk
-psycopg2-binary  # 用來連接 PostgreSQL
-gunicorn         # 生產環境下的網頁伺服器
+psycopg2-binary  # 用於 PostgreSQL 連線
