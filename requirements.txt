@@ -1,5 +1,5 @@
 Flask
 line-bot-sdk
-psycopg2-binary  # 連接 PostgreSQL
-gunicorn         # 部署時用的 Web 伺服器
-python-dotenv    # (可選，本地測試用)
+psycopg2
+gunicorn
+python-dotenv
