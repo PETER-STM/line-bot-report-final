@@ -7,3 +7,11 @@ __pycache__/
 
 # 忽略 Git 相關的暫存檔案或測試檔案
 123.git
+
+*.txt
+logs/
+*.log
+
+*.backup
+*.backup2
+services_GOOD_*.py

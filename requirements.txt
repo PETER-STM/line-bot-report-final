@@ -1,5 +1,11 @@
 Flask
 line-bot-sdk
-psycopg2
+psycopg2-binary
 gunicorn
 python-dotenv
+pytz
+APScheduler
+gspread
+google-auth
+rapidfuzz
+google-generativeai
