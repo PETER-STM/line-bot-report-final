@@ -178,11 +178,8 @@ def handle_record_expense_smart(text):
                         found_loc = raw_found.replace(" ", "").replace("號", "")
                         
                         if found_loc not in all_locs:
-                            is_newly_learned = True
-                            learn_cost = base_cost
-                            # 允許系統為每個新攤位獨立建檔
-                            ensure_location_exists_strict(conn, found_loc, base_loc=loc) 
-                            
+                            return f"⚠️ 找不到「{found_loc}」這個地點，我先沒記。\n▸ 新通路請先建檔：新增{found_loc} [金額]\n▸ 打錯字請用正確地點名重打一次"
+                             
                         text_processed = text_processed.replace(raw_found, " ")
                         break
 
