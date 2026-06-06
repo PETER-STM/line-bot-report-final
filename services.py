@@ -208,7 +208,7 @@ def handle_record_expense_smart(text):
                         if search_term != target_loc:
                             healing_note = f" (🤖修復: {search_term}➔{target_loc})"
                             try:
-                                cur.execute("INSERT INTO error_logs (error_type, error_message, original_input) VALUES (%s, %s, %s)", 
+                                cur.execute("INSERT INTO error_logs (error_type, error_trace, raw_payload) VALUES (%s, %s, %s)", 
                                     ('自我修復', f'將 [{search_term}] 自動修正為 [{target_loc}]', text))
                             except Exception:
                                 conn.rollback()
@@ -224,7 +224,7 @@ def handle_record_expense_smart(text):
                             text_processed = text_processed.replace(p, " ", 1)
                             healing_note = f" (🤖模糊修復: {p}➔{found_loc})"
                             try:
-                                cur.execute("INSERT INTO error_logs (error_type, error_message, original_input) VALUES (%s, %s, %s)", 
+                                cur.execute("INSERT INTO error_logs (error_type, error_trace, raw_payload) VALUES (%s, %s, %s)", 
                                     ('模糊修復', f'相似度匹配將 [{p}] 修正為 [{found_loc}]', text))
                             except Exception:
                                 conn.rollback()
@@ -240,7 +240,7 @@ def handle_record_expense_smart(text):
                             text_processed = text_processed.replace(p, " ", 1)
                             healing_note = f" (🤖模糊修復: {p}➔{found_loc})"
                             try:
-                                cur.execute("INSERT INTO error_logs (error_type, error_message, original_input) VALUES (%s, %s, %s)", 
+                                cur.execute("INSERT INTO error_logs (error_type, error_trace, raw_payload) VALUES (%s, %s, %s)", 
                                     ('模糊修復', f'相似度匹配將 [{p}] 修正為 [{found_loc}]', text))
                             except Exception:
                                 conn.rollback()
@@ -431,7 +431,7 @@ def handle_record_expense_smart(text):
             # 💡 [黑盒子啟動] 把害系統當機的「奇葩輸入」和「報錯原因」存起來
             try:
                 with conn.cursor() as cur:
-                    cur.execute("""INSERT INTO error_logs (error_type, error_message, original_input) 
+                    cur.execute("""INSERT INTO error_logs (error_type, error_trace, raw_payload) 
                         VALUES (%s, %s, %s)""", ('系統崩潰', str(e), text))
                     conn.commit()
             except: 

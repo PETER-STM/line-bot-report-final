@@ -245,8 +245,8 @@ def handle_admin(text):
                             
                             # [保險箱連線與防毒機制]
                             try:
-                                cur.execute("INSERT INTO audit_logs (action_type, target_table, record_details) VALUES (%s, %s, %s)", 
-                                    ('刪除出攤紀錄', 'projects', f"刪除 {date_str} {loc_name} | 原輸入: {orig_msg[:30]}"))
+                                cur.execute("INSERT INTO audit_logs (event_type, action_text) VALUES (%s, %s)",
+    (                           '刪除出攤紀錄', f"刪除 {date_str} {loc_name} | 原輸入: {orig_msg[:30]}"))
                                 conn.commit() 
                             except Exception:
                                 conn.rollback() 
