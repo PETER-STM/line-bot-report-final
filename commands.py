@@ -229,7 +229,11 @@ def handle_admin(text):
                     date_str = parts[1]
                     loc_name = parts[2]
                     try:
-                        month, day = map(int, date_str.split('/'))
+                    
+                        date_match = re.match(r'(\d+)/(\d+)', date_str)
+                        if not date_match:
+                            return f"❌ 日期格式無法解析: {date_str}，請用「刪除 5/24 市集」格式"
+                        month, day = int(date_match.group(1)), int(date_match.group(2))
                         target_date = date(date.today().year, month, day)
                         
                         cur.execute("SELECT project_id, original_msg FROM projects WHERE record_date=%s AND location_name LIKE %s", (target_date, f"%{loc_name}%"))
