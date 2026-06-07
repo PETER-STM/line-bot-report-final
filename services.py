@@ -130,6 +130,7 @@ def handle_record_expense_smart(text):
                 text_processed = text_processed.replace(word, ' ')
 
             # 💡 [延後執行] 智能切割刀
+            loc_variant_numbers = set(m.group(2) for m in re.finditer(r'([\u4e00-\u9fa5a-zA-Z]+)(0|[1-9]\d*0)(?=\s|$)', text_processed))
             text_processed = re.sub(r'([\u4e00-\u9fa5a-zA-Z]+)(0|[1-9]\d*0)(?=\s|$)', r'\1 \2', text_processed)
 
             # 3. 💡 [核心修復] 價格萃取 (從右到左，避免吃到攤位號碼)
@@ -141,6 +142,7 @@ def handle_record_expense_smart(text):
                 p_clean = p.strip().replace(',', '').replace('元', '').replace('$', '')
                 if p_clean.isdigit():
                     if len(p_clean) == 8 and p_clean.startswith('20'): continue
+                    if p_clean in loc_variant_numbers: continue
                     manual_override = int(p_clean)
                     # 從字串中安全移除該價格，避免後續地點解析抓錯
                     parts = text_processed.rsplit(p, 1)
