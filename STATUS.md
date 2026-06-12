@@ -1,3 +1,5 @@
-① 本次改動：CLAUDE.md 新增 commit 前 STATUS.md 規則
-② py_compile 結果：不適用(非 .py 改動)
-③ 測試結果：未跑
+# STATUS
+- Change: parser replay test harness + stable baseline (PYTHONHASHSEED=0)
+- py_compile: PASS (test_parser.py)
+- Replay: 418 consistent / 272 divergent (PATCH=12 DRIFT=61 UNKNOWN=199) / 72 skipped
+- Details: tests/B2_findings.md

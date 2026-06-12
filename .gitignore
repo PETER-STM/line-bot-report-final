@@ -15,3 +15,8 @@ logs/
 *.backup
 *.backup2
 services_GOOD_*.py
+
+tests/*
+!tests/test_parser.py
+!tests/write_parser.py
+!tests/B2_findings.md
