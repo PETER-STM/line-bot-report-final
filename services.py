@@ -71,7 +71,7 @@ def handle_record_expense_smart(text):
             is_newly_learned = False
 
             # 1. 準備資料
-            cur.execute("SELECT location_name, monthly_rent, cleaning_fee, weekday_cost, business_days, shared_members FROM locations")
+            cur.execute("SELECT location_name, monthly_rent, cleaning_fee, weekday_cost, business_days, shared_members FROM locations ORDER BY location_name")
             loc_data = {row[0]: {'rent': row[1], 'clean': row[2], 'cost': row[3], 'days': row[4], 'shared': row[5]} for row in cur.fetchall()}
             
             cur.execute("SELECT alias_name, target_location FROM location_aliases")
@@ -397,7 +397,7 @@ def handle_record_expense_smart(text):
                 pid = cur.fetchone()[0]
 
             # 8. 寫入
-            final_members_list = list(final_members)
+            final_members_list = sorted(final_members)
             
             cur.execute("INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (COMPANY_NAME,))
 
