@@ -20,3 +20,4 @@ tests/*
 !tests/test_parser.py
 !tests/write_parser.py
 !tests/B2_findings.md
+!tests/verify.py

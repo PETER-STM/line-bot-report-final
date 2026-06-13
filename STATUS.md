@@ -1,5 +1,4 @@
 # STATUS
-- Change: parser replay test harness + stable baseline (PYTHONHASHSEED=0)
-- py_compile: PASS (test_parser.py)
-- Replay: 418 consistent / 272 divergent (PATCH=12 DRIFT=61 UNKNOWN=199) / 72 skipped
-- Details: tests/B2_findings.md
+- Change: docs: add transport/escaping protocol v1; add tests/verify.py (md5 checker)
+- py_compile: PASS (verify.py)
+- Test: python tests/verify.py 8cd780ba413cefd60f599e6e9988990f STATUS.md => PASS
